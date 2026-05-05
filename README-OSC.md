@@ -1,47 +1,49 @@
-# Vaultwarden on Eyevinn Open Source Cloud
+# Eyevinn Open Source Cloud
 
-Vaultwarden is an unofficial Bitwarden-compatible server written in Rust. It is fully compatible with all Bitwarden clients (desktop, mobile, browser extensions, CLI) and uses a fraction of the resources compared to the official Bitwarden server.
+## Turn Your Open Source Project into a Revenue Stream
 
-## Features
+Welcome to [Eyevinn Open Source Cloud](https://www.osaas.io) - the platform that democratizes infrastructure and creates sustainable revenue for open source creators.
 
-- Full Bitwarden client compatibility
-- Password vault synchronization across all devices
-- Secure password sharing (Organizations)
-- Two-factor authentication support
-- Emergency access
-- File attachments
-- Send functionality
-- Admin web interface
+### Why Eyevinn Open Source Cloud Benefits You as a Creator
 
-## Quick Start on OSC
+**🚀 Zero Infrastructure Costs**  
+Your users get enterprise-grade hosting and scaling without you managing servers, paying hosting bills, or dealing with DevOps complexity. We handle the infrastructure so you can focus on what you do best - building great software.
 
-Deploy Vaultwarden on Eyevinn Open Source Cloud. By default it uses SQLite for storage (included). For production use, a PostgreSQL database is recommended.
+**💰 Monetize Your Open Source Work**  
+Finally get paid for your contributions to the open source ecosystem. When users deploy your project through our platform, you automatically receive a share of the revenue. No complicated pricing models or payment processing required.
 
-## Environment Variables
+**📈 Reach More Users**  
+Remove the biggest barrier to adoption - deployment complexity. Your project becomes instantly accessible to non-technical users and small teams who need your solution but lack the resources for self-hosting.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | No | Database URL (SQLite default: `/data/db.sqlite3`). Use `postgresql://` for PostgreSQL |
-| `ADMIN_TOKEN` | No | Token for accessing the `/admin` interface (leave empty to disable) |
-| `SIGNUPS_ALLOWED` | No | Allow new user registration (default: `true`) |
-| `INVITATIONS_ALLOWED` | No | Allow org invitations (default: `true`) |
-| `SMTP_HOST` | No | SMTP server for email notifications |
-| `SMTP_PORT` | No | SMTP port |
-| `SMTP_FROM` | No | From email address |
-| `SMTP_USERNAME` | No | SMTP username |
-| `SMTP_PASSWORD` | No | SMTP password |
-| `PUSH_ENABLED` | No | Enable mobile push notifications |
-| `PUSH_INSTALLATION_ID` | No | Bitwarden installation ID for push |
-| `PUSH_INSTALLATION_KEY` | No | Bitwarden installation key for push |
+**🎯 Level the Playing Field**  
+Small and medium projects now have access to the same infrastructure capabilities as big tech companies. Your innovative tool can compete on features, not on who has the biggest infrastructure budget.
 
-## Notes
+### How It Works
 
-- Data is stored at `/data` — mount a persistent volume for production use
-- Configure Bitwarden clients with your OSC instance URL
-- AGPL-3.0 licensed — OSC runs the unmodified server binary
+1. **Claim Ownership**: Create your account on [osaas.io](https://www.osaas.io) and connect your GitHub account
+2. **Automatic Recognition**: We verify your ownership of this repository
+3. **Instant Revenue**: Start earning from every deployment of your project
+4. **Focus on Code**: Continue developing while we handle scaling, security, and operations
 
-## Links
+### For Your Users
 
-- [Official Documentation](https://github.com/dani-garcia/vaultwarden/wiki)
-- [GitHub Repository](https://github.com/dani-garcia/vaultwarden)
-- [Eyevinn Open Source Cloud](https://www.osaas.io)
+Users pay only for what they use, getting professional-grade hosting without the complexity. They can deploy your project in minutes instead of hours or days, making your solution accessible to a broader audience.
+
+### Community & Support
+
+Join our vibrant community of open source creators:
+
+- **💬 [Slack Workspace](https://slack.osaas.io)** - Connect with other creators, get help, and share your experiences
+- **🐙 [GitHub](https://github.com/EyevinnOSC)** - Contribute to the platform and follow development updates  
+- **💼 [LinkedIn](https://www.linkedin.com/company/eyevinn-open-source-cloud/)** - Stay updated with news and announcements
+- **📚 [Documentation](https://docs.osaas.io)** - User guides and best practices
+
+### Join the Movement
+
+Help us democratize access to open source infrastructure and create a sustainable ecosystem where creators are rewarded for their contributions.
+
+**[Get Started →](https://www.osaas.io)**
+
+---
+
+*Eyevinn Open Source Cloud - Making open source more accessible, one deployment at a time.*
