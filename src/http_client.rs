@@ -5,17 +5,24 @@ use std::{
     time::Duration,
 };
 
-use hickory_resolver::{net::runtime::TokioRuntimeProvider, TokioResolver};
+use hickory_resolver::{TokioResolver, net::runtime::TokioRuntimeProvider};
 use regex::Regex;
 use reqwest::{
+    Client, ClientBuilder,
     dns::{Name, Resolve, Resolving},
-    header, Client, ClientBuilder,
+    header,
 };
 use url::Host;
 
-use crate::{util::is_global, CONFIG};
+use crate::{
+    CONFIG,
+    util::{get_env_bool, is_global},
+};
 
 pub fn make_http_request(method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder, crate::Error> {
+    static INSTANCE: LazyLock<Client> =
+        LazyLock::new(|| get_reqwest_client_builder(true).build().expect("Failed to build client"));
+
     let Ok(url) = url::Url::parse(url) else {
         err!("Invalid URL");
     };
@@ -25,17 +32,14 @@ pub fn make_http_request(method: reqwest::Method, url: &str) -> Result<reqwest::
 
     should_block_host(&host)?;
 
-    static INSTANCE: LazyLock<Client> =
-        LazyLock::new(|| get_reqwest_client_builder().build().expect("Failed to build client"));
-
     Ok(INSTANCE.request(method, url))
 }
 
-pub fn get_reqwest_client_builder() -> ClientBuilder {
+pub fn get_reqwest_client_builder(enforce_block: bool) -> ClientBuilder {
     let mut headers = header::HeaderMap::new();
     headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Vaultwarden"));
 
-    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 5 {
             return attempt.error("Too many redirects");
         }
@@ -44,7 +48,7 @@ pub fn get_reqwest_client_builder() -> ClientBuilder {
             return attempt.error("Invalid host");
         };
 
-        if let Err(e) = should_block_host(&host) {
+        if enforce_block && let Err(e) = should_block_host(&host) {
             return attempt.error(e);
         }
 
@@ -54,8 +58,16 @@ pub fn get_reqwest_client_builder() -> ClientBuilder {
     Client::builder()
         .default_headers(headers)
         .redirect(redirect_policy)
-        .dns_resolver(CustomDnsResolver::instance())
+        .dns_resolver(CustomDns::instance(enforce_block))
         .timeout(Duration::from_secs(10))
+}
+
+fn dns_prefer_ipv6() -> bool {
+    // CONFIG may require DNS to initialize, so avoid forcing it during bootstrap.
+    match LazyLock::get(&CONFIG) {
+        Some(config) => config.dns_prefer_ipv6(),
+        None => get_env_bool("DNS_PREFER_IPV6").unwrap_or(false),
+    }
 }
 
 fn should_block_ip(ip: IpAddr) -> bool {
@@ -67,18 +79,19 @@ fn should_block_ip(ip: IpAddr) -> bool {
 }
 
 fn should_block_address_regex(domain_or_ip: &str) -> bool {
+    static COMPILED_REGEX: Mutex<Option<(String, Regex)>> = Mutex::new(None);
+
     let Some(block_regex) = CONFIG.http_request_block_regex() else {
         return false;
     };
 
-    static COMPILED_REGEX: Mutex<Option<(String, Regex)>> = Mutex::new(None);
     let mut guard = COMPILED_REGEX.lock().unwrap();
 
     // If the stored regex is up to date, use it
-    if let Some((value, regex)) = &*guard {
-        if value == &block_regex {
-            return regex.is_match(domain_or_ip);
-        }
+    if let Some((value, regex)) = &*guard
+        && value == &block_regex
+    {
+        return regex.is_match(domain_or_ip);
     }
 
     // If we don't have a regex stored, or it's not up to date, recreate it
@@ -92,7 +105,7 @@ fn should_block_address_regex(domain_or_ip: &str) -> bool {
 pub fn get_valid_host(host: &str) -> Result<Host, CustomHttpClientError> {
     let Ok(host) = Host::parse(host) else {
         return Err(CustomHttpClientError::Invalid {
-            domain: host.to_string(),
+            domain: host.to_owned(),
         });
     };
 
@@ -136,16 +149,16 @@ pub fn should_block_host<S: AsRef<str>>(host: &Host<S>) -> Result<(), CustomHttp
     let (ip, host_str): (Option<IpAddr>, String) = match host {
         Host::Ipv4(ip) => (Some(IpAddr::V4(*ip)), ip.to_string()),
         Host::Ipv6(ip) => (Some(IpAddr::V6(*ip)), ip.to_string()),
-        Host::Domain(d) => (None, d.as_ref().to_string()),
+        Host::Domain(d) => (None, d.as_ref().to_owned()),
     };
 
-    if let Some(ip) = ip {
-        if should_block_ip(ip) {
-            return Err(CustomHttpClientError::NonGlobalIp {
-                domain: None,
-                ip,
-            });
-        }
+    if let Some(ip) = ip
+        && should_block_ip(ip)
+    {
+        return Err(CustomHttpClientError::NonGlobalIp {
+            domain: None,
+            ip,
+        });
     }
 
     if should_block_address_regex(&host_str) {
@@ -172,6 +185,27 @@ pub enum CustomHttpClientError {
 }
 
 impl CustomHttpClientError {
+    /// Attach the domain that resolved to this address, which `should_block_host()` can't know.
+    fn with_domain(self, name: &str) -> Self {
+        match self {
+            Self::NonGlobalIp {
+                ip,
+                ..
+            } => Self::NonGlobalIp {
+                domain: Some(name.to_owned()),
+                ip,
+            },
+            Self::Blocked {
+                domain,
+            } => Self::Blocked {
+                domain: format!("{name} ({domain})"),
+            },
+            other @ Self::Invalid {
+                ..
+            } => other,
+        }
+    }
+
     pub fn downcast_ref(e: &dyn std::error::Error) -> Option<&Self> {
         let mut source = e.source();
 
@@ -208,6 +242,11 @@ impl fmt::Display for CustomHttpClientError {
 
 impl std::error::Error for CustomHttpClientError {}
 
+pub struct CustomDns {
+    enforce_block: bool,
+    resolver: Arc<CustomDnsResolver>,
+}
+
 #[derive(Debug, Clone)]
 enum CustomDnsResolver {
     Default(),
@@ -215,55 +254,69 @@ enum CustomDnsResolver {
 }
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-impl CustomDnsResolver {
-    fn instance() -> Arc<Self> {
+impl CustomDns {
+    fn instance(enforce_block: bool) -> Self {
         static INSTANCE: LazyLock<Arc<CustomDnsResolver>> = LazyLock::new(CustomDnsResolver::new);
-        Arc::clone(&*INSTANCE)
-    }
 
+        CustomDns {
+            enforce_block,
+            resolver: Arc::clone(&*INSTANCE),
+        }
+    }
+}
+
+impl CustomDnsResolver {
     fn new() -> Arc<Self> {
         TokioResolver::builder(TokioRuntimeProvider::default())
             .and_then(|mut builder| {
-                // Hickory's default since v0.26 is `Ipv6AndIpv4`, which sorts IPv6 first
-                // This might cause issues on IPv4 only systems or containers
-                // Unless someone enabled DNS_PREFER_IPV6, use Ipv4AndIpv6, which returns IPv4 first which was our previous default
-                if !CONFIG.dns_prefer_ipv6() {
-                    builder.options_mut().ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
-                }
+                // Query both families; the preferred order is applied per lookup below.
+                builder.options_mut().ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
                 builder.build()
             })
             .inspect_err(|e| warn!("Error creating Hickory resolver, falling back to default: {e:?}"))
-            .map(|resolver| Arc::new(Self::Hickory(Arc::new(resolver))))
-            .unwrap_or_else(|_| Arc::new(Self::Default()))
+            .map_or_else(|_| Arc::new(Self::Default()), |resolver| Arc::new(Self::Hickory(Arc::new(resolver))))
     }
 
     // Note that we get an iterator of addresses, but we only grab the first one for convenience
-    async fn resolve_domain(&self, name: &str) -> Result<Vec<SocketAddr>, BoxError> {
-        pre_resolve(name)?;
+    async fn resolve_domain(&self, name: &str, enforce_block: bool) -> Result<Vec<SocketAddr>, BoxError> {
+        pre_resolve(name, enforce_block)?;
 
         let results: Vec<SocketAddr> = match self {
             Self::Default() => tokio::net::lookup_host((name, 0)).await?.collect(),
             Self::Hickory(r) => r.lookup_ip(name).await?.iter().map(|i| SocketAddr::new(i, 0)).collect(),
         };
 
-        for addr in &results {
-            post_resolve(name, addr.ip())?;
+        if enforce_block {
+            for addr in &results {
+                post_resolve(name, addr.ip())?;
+            }
         }
 
         Ok(results)
     }
 }
 
-fn pre_resolve(name: &str) -> Result<(), CustomHttpClientError> {
+fn sort_addresses(addresses: &mut [SocketAddr], prefer_ipv6: bool) {
+    // `sort_by_key` orders `false` before `true`.
+    // When IPv6 is preferred, IPv6 addresses return `false` for `is_ipv4()` and sort first.
+    // When IPv4 is preferred, IPv4 addresses return `false` for `is_ipv6()` and sort first.
+    if prefer_ipv6 {
+        addresses.sort_by_key(SocketAddr::is_ipv4);
+    } else {
+        addresses.sort_by_key(SocketAddr::is_ipv6);
+    }
+}
+
+fn pre_resolve(name: &str, enforce_block: bool) -> Result<(), CustomHttpClientError> {
     let Ok(host) = get_valid_host(name) else {
         return Err(CustomHttpClientError::Invalid {
-            domain: name.to_string(),
+            domain: name.to_owned(),
         });
     };
 
-    if should_block_host(&host).is_err() {
+    if enforce_block && should_block_host(&host).is_err() {
         return Err(CustomHttpClientError::Blocked {
-            domain: name.to_string(),
+            domain: name.to_owned(),
         });
     }
 
@@ -271,22 +324,23 @@ fn pre_resolve(name: &str) -> Result<(), CustomHttpClientError> {
 }
 
 fn post_resolve(name: &str, ip: IpAddr) -> Result<(), CustomHttpClientError> {
-    if should_block_ip(ip) {
-        Err(CustomHttpClientError::NonGlobalIp {
-            domain: Some(name.to_string()),
-            ip,
-        })
-    } else {
-        Ok(())
-    }
+    let host: Host<&str> = match ip {
+        IpAddr::V4(ip) => Host::Ipv4(ip),
+        IpAddr::V6(ip) => Host::Ipv6(ip),
+    };
+
+    should_block_host(&host).map_err(|e| e.with_domain(name))
 }
 
-impl Resolve for CustomDnsResolver {
+impl Resolve for CustomDns {
     fn resolve(&self, name: Name) -> Resolving {
-        let this = self.clone();
+        let enforce_block = self.enforce_block;
+        let this = Arc::clone(&self.resolver);
         Box::pin(async move {
             let name = name.as_str();
-            let results = this.resolve_domain(name).await?;
+            let mut results = this.resolve_domain(name, enforce_block).await?;
+            // Recheck after bootstrap so long-lived clients adopt the loaded config.
+            sort_addresses(&mut results, dns_prefer_ipv6());
             if results.is_empty() {
                 warn!("Unable to resolve {name} to any valid IP address");
             }
@@ -305,10 +359,29 @@ pub(crate) mod aws {
     };
     use reqwest::Client;
 
+    use super::get_reqwest_client_builder;
+
     // Adapter that wraps reqwest to be compatible with the AWS SDK
     #[derive(Debug)]
     pub(crate) struct AwsReqwestConnector {
-        pub(crate) client: Client,
+        client: Client,
+    }
+
+    impl AwsReqwestConnector {
+        pub(crate) fn new() -> Self {
+            let client = get_reqwest_client_builder(false).build().expect("Failed to build AWS HTTP client");
+            Self {
+                client,
+            }
+        }
+    }
+
+    fn connector_error(error: reqwest::Error) -> ConnectorError {
+        if error.is_timeout() {
+            ConnectorError::timeout(Box::new(error))
+        } else {
+            ConnectorError::io(Box::new(error))
+        }
     }
 
     impl HttpConnector for AwsReqwestConnector {
@@ -318,7 +391,7 @@ pub(crate) mod aws {
             let future = async move {
                 let method = reqwest::Method::from_bytes(request.method().as_bytes())
                     .map_err(|e| ConnectorError::user(Box::new(e)))?;
-                let mut req_builder = client.request(method, request.uri().to_string());
+                let mut req_builder = client.request(method, request.uri().to_owned());
 
                 for (name, value) in request.headers() {
                     req_builder = req_builder.header(name, value);
@@ -328,10 +401,10 @@ pub(crate) mod aws {
                     req_builder = req_builder.body(body_bytes.to_vec());
                 }
 
-                let response = req_builder.send().await.map_err(|e| ConnectorError::io(Box::new(e)))?;
+                let response = req_builder.send().await.map_err(connector_error)?;
 
                 let status = response.status().into();
-                let bytes = response.bytes().await.map_err(|e| ConnectorError::io(Box::new(e)))?;
+                let bytes = response.bytes().await.map_err(connector_error)?;
 
                 Ok(HttpResponse::new(status, bytes.into()))
             };
@@ -357,7 +430,7 @@ pub(crate) mod aws {
 mod tests {
     use super::*;
     use crate::util::is_global_hardcoded;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use url::Host;
 
     // ===
@@ -371,9 +444,29 @@ mod tests {
     }
 
     #[test]
+    fn dns_setup_does_not_initialize_config() {
+        assert!(LazyLock::get(&CONFIG).is_none());
+        drop(CustomDns::instance(false));
+        assert!(LazyLock::get(&CONFIG).is_none());
+    }
+
+    #[test]
+    fn dns_preference_orders_addresses() {
+        let ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        let mut addresses = [ipv6, ipv4];
+
+        sort_addresses(&mut addresses, false);
+        assert_eq!(addresses, [ipv4, ipv6]);
+
+        sort_addresses(&mut addresses, true);
+        assert_eq!(addresses, [ipv6, ipv4]);
+    }
+
+    #[test]
     fn dotted_decimal_loopback_normalizes() {
         let ip = parse_to_ip("127.0.0.1").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
@@ -381,21 +474,21 @@ mod tests {
     fn single_decimal_loopback_normalizes() {
         // 127.0.0.1 == 2130706433
         let ip = parse_to_ip("2130706433").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
     #[test]
     fn hex_loopback_normalizes() {
         let ip = parse_to_ip("0x7f000001").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
     #[test]
     fn dotted_hex_loopback_normalizes() {
         let ip = parse_to_ip("0x7f.0.0.1").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
@@ -403,14 +496,14 @@ mod tests {
     fn octal_loopback_normalizes() {
         // 017700000001 == 127.0.0.1
         let ip = parse_to_ip("017700000001").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
     #[test]
     fn dotted_octal_loopback_normalizes() {
         let ip = parse_to_ip("0177.0.0.01").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!is_global_hardcoded(ip));
     }
 
@@ -442,19 +535,19 @@ mod tests {
     #[test]
     fn get_valid_host_normalizes_decimal_int() {
         let h = get_valid_host("2130706433").expect("valid");
-        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::LOCALHOST));
     }
 
     #[test]
     fn get_valid_host_normalizes_hex() {
         let h = get_valid_host("0x7f000001").expect("valid");
-        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::LOCALHOST));
     }
 
     #[test]
     fn get_valid_host_normalizes_octal() {
         let h = get_valid_host("017700000001").expect("valid");
-        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(matches!(h, Host::Ipv4(ip) if ip == Ipv4Addr::LOCALHOST));
     }
 
     // ===

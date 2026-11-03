@@ -1,23 +1,29 @@
+use std::cmp::Ordering;
+
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
 use num_traits::FromPrimitive;
 use serde_json::Value;
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
+
+use crate::{
+    CONFIG,
+    api::EmptyResult,
+    db::{
+        DbConn,
+        schema::{
+            ciphers, ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
+            organizations, users, users_collections, users_organizations,
+        },
+    },
+    error::MapResult,
 };
+use macros::UuidFromParam;
 
 use super::{
-    CipherId, Collection, CollectionGroup, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
+    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy, OrgPolicyType,
+    TwoFactor, User, UserId,
 };
-use crate::db::schema::{
-    ciphers, ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
-    organizations, users, users_collections, users_organizations,
-};
-use crate::CONFIG;
-use macros::UuidFromParam;
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = organizations)]
@@ -93,6 +99,10 @@ pub enum MembershipType {
 
 impl MembershipType {
     pub fn from_str(s: &str) -> Option<Self> {
+        #[expect(
+            clippy::match_same_arms,
+            reason = "Specifically define `4|Custom` since this is a hack, not a default"
+        )]
         match s {
             "0" | "Owner" => Some(MembershipType::Owner),
             "1" | "Admin" => Some(MembershipType::Admin),
@@ -204,11 +214,18 @@ impl Organization {
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
             "selfHost": true,
             "useApi": true,
+            "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
+            "useInviteLinks": false, // Not (yet) supported
+            "useMyItems": false, // Not (yet) supported
+            "useOrganizationDomains": false, // Not supported (Linked to SSO)
+            "usePam": false, // Not supported
+            "usePhishingBlocker": false,
             "hasPublicAndPrivateKeys": self.private_key.is_some() && self.public_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
             "allowAdminAccessToAllCollectionItems": true,
             "limitCollectionCreation": true,
             "limitCollectionDeletion": true,
+            "limitItemDeletion": false,
 
             "businessName": self.name,
             "businessAddress1": null,
@@ -321,42 +338,28 @@ impl OrganizationApiKey {
     }
 }
 
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
 /// Database methods
 impl Organization {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         if !crate::util::is_valid_email(&self.billing_email) {
-            err!(format!("BillingEmail {} is not a valid email address", self.billing_email))
+            err!(format!("BillingEmail {} is not a valid email address", self.billing_email.escape_debug()))
         }
 
-        for member in Membership::find_by_org(&self.uuid, conn).await.iter() {
+        for member in &Membership::find_by_org(&self.uuid, conn).await {
             User::update_uuid_revision(&member.user_uuid, conn).await;
         }
 
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(organizations::table)
+            mysql {
+                diesel::insert_into(organizations::table)
                     .values(self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(self)
                     .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(organizations::table)
-                            .filter(organizations::uuid.eq(&self.uuid))
-                            .set(self)
-                            .execute(conn)
-                            .map_res("Error saving organization")
-                    }
-                    Err(e) => Err(e.into()),
-                }.map_res("Error saving organization")
-
+                    .map_res("Error saving organization")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(organizations::table)
                     .values(self)
                     .on_conflict(organizations::uuid)
@@ -369,8 +372,6 @@ impl Organization {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
-        use super::{Cipher, Collection};
-
         Cipher::delete_all_by_organization(&self.uuid, conn).await?;
         Collection::delete_all_by_organization(&self.uuid, conn).await?;
         Membership::delete_all_by_organization(&self.uuid, conn).await?;
@@ -378,43 +379,30 @@ impl Organization {
         Group::delete_all_by_organization(&self.uuid, conn).await?;
         OrganizationApiKey::delete_all_by_organization(&self.uuid, conn).await?;
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
                 .execute(conn)
                 .map_res("Error saving organization")
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_uuid(uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            organizations::table
-                .filter(organizations::uuid.eq(uuid))
-                .first::<Self>(conn)
-                .ok()
-        }}
+        conn.run(move |conn| organizations::table.filter(organizations::uuid.eq(uuid)).first::<Self>(conn).ok()).await
     }
 
     pub async fn find_by_name(name: &str, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            organizations::table
-                .filter(organizations::name.eq(name))
-                .first::<Self>(conn)
-                .ok()
-        }}
+        conn.run(move |conn| organizations::table.filter(organizations::name.eq(name)).first::<Self>(conn).ok()).await
     }
 
     pub async fn get_all(conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
-            organizations::table
-                .load::<Self>(conn)
-                .expect("Error loading organizations")
-        }}
+        conn.run(move |conn| organizations::table.load::<Self>(conn).expect("Error loading organizations")).await
     }
 
     pub async fn find_main_org_user_email(user_email: &str, conn: &DbConn) -> Option<Self> {
         let lower_mail = user_email.to_lowercase();
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             organizations::table
                 .inner_join(users_organizations::table.on(users_organizations::org_uuid.eq(organizations::uuid)))
                 .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
@@ -424,13 +412,14 @@ impl Organization {
                 .select(organizations::all_columns)
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_org_user_email(user_email: &str, conn: &DbConn) -> Vec<Self> {
         let lower_mail = user_email.to_lowercase();
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             organizations::table
                 .inner_join(users_organizations::table.on(users_organizations::org_uuid.eq(organizations::uuid)))
                 .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
@@ -440,7 +429,8 @@ impl Organization {
                 .select(organizations::all_columns)
                 .load::<Self>(conn)
                 .expect("Error loading user orgs")
-        }}
+        })
+        .await
     }
 }
 
@@ -500,6 +490,12 @@ impl Membership {
             "useActivateAutofillPolicy": false,
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
+            "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
+            "useInviteLinks": false, // Not (yet) supported
+            "useMyItems": false, // Not (yet) supported
+            "useOrganizationDomains": false, // Not supported (Linked to SSO)
+            "usePam": false, // Not supported
+            "usePhishingBlocker": false,
 
             "organizationUserId": self.uuid,
             "providerId": null,
@@ -519,8 +515,7 @@ impl Membership {
             "limitCollectionDeletion": true,
             "limitItemDeletion": false,
             "allowAdminAccessToAllCollectionItems": true,
-            "userIsManagedByOrganization": false, // Means not managed via the Members UI, like SSO
-            "userIsClaimedByOrganization": false, // The new key instead of the obsolete userIsManagedByOrganization
+            "userIsClaimedByOrganization": false, // Means not managed via the Members UI, like SSO
 
             "permissions": permissions,
 
@@ -528,7 +523,8 @@ impl Membership {
 
             // These are per user
             "userId": self.user_uuid,
-            "key": self.akey,
+            // Accepted (not yet confirmed) members have no key yet; send null like upstream, not ""
+            "key": (!self.akey.is_empty()).then_some(&self.akey),
             "status": self.status,
             "type": membership_type,
             "enabled": true,
@@ -537,7 +533,13 @@ impl Membership {
         })
     }
 
-    pub async fn to_json_user_details(&self, include_collections: bool, include_groups: bool, conn: &DbConn) -> Value {
+    // Used by admins to view other members, so nothing here may depend on this member's status
+    pub async fn to_json_details_for_admin(
+        &self,
+        include_collections: bool,
+        include_groups: bool,
+        conn: &DbConn,
+    ) -> Value {
         let user = User::find_by_uuid(&self.user_uuid, conn).await.unwrap();
 
         // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
@@ -555,61 +557,32 @@ impl Membership {
         } else {
             // The Bitwarden clients seem to call this API regardless of whether groups are enabled,
             // so just act as if there are no groups.
-            Vec::with_capacity(0)
+            Vec::new()
         };
 
         // Check if a user is in a group which has access to all collections
         // If that is the case, we should not return individual collections!
+        // This is used by admins to view other members, so it must not depend on the membership status
         let full_access_group =
-            CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
+            CONFIG.org_groups_enabled() && GroupUser::has_full_access_by_member(&self.org_uuid, &self.uuid, conn).await;
 
         // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
+        // Only the collections assigned directly are returned, the ones assigned via a group are returned via a special group endpoint
         let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
-            // Get all collections for the user here already to prevent more queries
-            let cu: HashMap<CollectionId, CollectionUser> =
-                CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                    .await
-                    .into_iter()
-                    .map(|cu| (cu.collection_uuid.clone(), cu))
-                    .collect();
-
-            // Get all collection groups for this user to prevent there inclusion
-            let cg: HashSet<CollectionId> = CollectionGroup::find_by_user(&self.user_uuid, conn)
+            CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
                 .await
                 .into_iter()
-                .map(|cg| cg.collections_uuid)
-                .collect();
-
-            Collection::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                .await
-                .into_iter()
-                .filter_map(|c| {
-                    let (read_only, hide_passwords, manage) = if self.has_full_access() {
-                        (false, false, self.atype >= MembershipType::Manager)
-                    } else if let Some(cu) = cu.get(&c.uuid) {
-                        (
-                            cu.read_only,
-                            cu.hide_passwords,
-                            cu.manage || (self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords),
-                        )
-                    // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
-                    // Those are returned via a special group endpoint
-                    } else if cg.contains(&c.uuid) {
-                        return None;
-                    } else {
-                        (true, true, false)
-                    };
-
-                    Some(json!({
-                        "id": c.uuid,
-                        "readOnly": read_only,
-                        "hidePasswords": hide_passwords,
-                        "manage": manage,
-                    }))
+                .map(|cu| {
+                    json!({
+                        "id": cu.collection_uuid,
+                        "readOnly": cu.read_only,
+                        "hidePasswords": cu.hide_passwords,
+                        "manage": cu.manage || (self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords),
+                    })
                 })
                 .collect()
         } else {
-            Vec::with_capacity(0)
+            Vec::new()
         };
 
         // HACK: Convert the manager type to a custom type
@@ -653,7 +626,6 @@ impl Membership {
 
             "status": status,
             "type": membership_type,
-            "accessAll": self.access_all,
             "twoFactorEnabled": twofactor_enabled,
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "hasMasterPassword": !user.password_hash.is_empty(),
@@ -661,7 +633,6 @@ impl Membership {
             "permissions": permissions,
 
             "ssoBound": false, // Not supported
-            "managedByOrganization": false, // This key is obsolete replaced by claimedByOrganization
             "claimedByOrganization": false, // Means not managed via the Members UI, like SSO
             "usesKeyConnector": false, // Not supported
             "accessSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
@@ -712,7 +683,6 @@ impl Membership {
 
             "status": status,
             "type": self.atype,
-            "accessAll": self.access_all,
             "collections": coll_uuids,
 
             "object": "organizationUserDetails",
@@ -745,24 +715,16 @@ impl Membership {
         User::update_uuid_revision(&self.user_uuid, conn).await;
 
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(users_organizations::table)
+            mysql {
+                diesel::insert_into(users_organizations::table)
                     .values(self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(self)
                     .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(users_organizations::table)
-                            .filter(users_organizations::uuid.eq(&self.uuid))
-                            .set(self)
-                            .execute(conn)
-                            .map_res("Error adding user to organization")
-                    },
-                    Err(e) => Err(e.into()),
-                }.map_res("Error adding user to organization")
+                    .map_res("Error adding user to organization")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(users_organizations::table)
                     .values(self)
                     .on_conflict(users_organizations::uuid)
@@ -780,11 +742,12 @@ impl Membership {
         CollectionUser::delete_all_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await?;
         GroupUser::delete_all_by_member(&self.uuid, conn).await?;
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
                 .execute(conn)
                 .map_res("Error removing user from organization")
-        }}
+        })
+        .await
     }
 
     pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
@@ -802,10 +765,10 @@ impl Membership {
     }
 
     pub async fn find_by_email_and_org(email: &str, org_uuid: &OrganizationId, conn: &DbConn) -> Option<Membership> {
-        if let Some(user) = User::find_by_mail(email, conn).await {
-            if let Some(member) = Membership::find_by_user_and_org(&user.uuid, org_uuid, conn).await {
-                return Some(member);
-            }
+        if let Some(user) = User::find_by_mail(email, conn).await
+            && let Some(member) = Membership::find_by_user_and_org(&user.uuid, org_uuid, conn).await
+        {
+            return Some(member);
         }
 
         None
@@ -824,64 +787,82 @@ impl Membership {
     }
 
     pub async fn find_by_uuid(uuid: &MembershipId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            users_organizations::table
-                .filter(users_organizations::uuid.eq(uuid))
-                .first::<Self>(conn)
-                .ok()
-        }}
+        conn.run(move |conn| {
+            users_organizations::table.filter(users_organizations::uuid.eq(uuid)).first::<Self>(conn).ok()
+        })
+        .await
     }
 
     pub async fn find_by_uuid_and_org(uuid: &MembershipId, org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::uuid.eq(uuid))
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_confirmed_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
+    }
+
+    pub async fn find_accepted_and_confirmed_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(
+                    users_organizations::status
+                        .eq(MembershipStatus::Accepted as i32)
+                        .or(users_organizations::status.eq(MembershipStatus::Confirmed as i32)),
+                )
+                .load::<Self>(conn)
+                .unwrap_or_default()
+        })
+        .await
     }
 
     pub async fn find_invited_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Invited as i32))
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     // Should be used only when email are disabled.
     // In Organizations::send_invite status is set to Accepted only if the user has a password.
     pub async fn accept_user_invitations(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::update(users_organizations::table)
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Invited as i32))
                 .set(users_organizations::status.eq(MembershipStatus::Accepted as i32))
                 .execute(conn)
                 .map_res("Error confirming invitations")
-        }}
+        })
+        .await
     }
 
     pub async fn find_any_state_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     pub async fn count_accepted_and_confirmed_by_user(
@@ -889,70 +870,83 @@ impl Membership {
         excluded_org: &OrganizationId,
         conn: &DbConn,
     ) -> i64 {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::org_uuid.ne(excluded_org))
-                .filter(users_organizations::status.eq(MembershipStatus::Accepted as i32).or(users_organizations::status.eq(MembershipStatus::Confirmed as i32)))
+                .filter(
+                    users_organizations::status
+                        .eq(MembershipStatus::Accepted as i32)
+                        .or(users_organizations::status.eq(MembershipStatus::Confirmed as i32)),
+                )
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading user organizations")
-        }}
+        })
+        .await
     }
 
     pub async fn find_confirmed_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     // Get all users which are either owner or admin, or a manager which can manage/access all
     pub async fn find_confirmed_and_manage_all_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .filter(
-                    users_organizations::atype.eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32])
-                    .or(users_organizations::atype.eq(MembershipType::Manager as i32).and(users_organizations::access_all.eq(true)))
+                    users_organizations::atype
+                        .eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32])
+                        .or(users_organizations::atype
+                            .eq(MembershipType::Manager as i32)
+                            .and(users_organizations::access_all.eq(true))),
                 )
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     pub async fn count_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> i64 {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .count()
                 .first::<i64>(conn)
                 .ok()
                 .unwrap_or(0)
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_org_and_type(org_uuid: &OrganizationId, atype: MembershipType, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::atype.eq(atype as i32))
                 .load::<Self>(conn)
                 .expect("Error loading user organizations")
-        }}
+        })
+        .await
     }
 
     pub async fn count_confirmed_by_org_and_type(
@@ -960,7 +954,7 @@ impl Membership {
         atype: MembershipType,
         conn: &DbConn,
     ) -> i64 {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::atype.eq(atype as i32))
@@ -968,17 +962,19 @@ impl Membership {
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user_and_org(user_uuid: &UserId, org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_confirmed_by_user_and_org(
@@ -986,78 +982,66 @@ impl Membership {
         org_uuid: &OrganizationId,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::org_uuid.eq(org_uuid))
-                .filter(
-                    users_organizations::status.eq(MembershipStatus::Confirmed as i32)
-                )
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading user organizations")
-        }}
-    }
-
-    pub async fn get_orgs_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<OrganizationId> {
-        db_run! { conn: {
-            users_organizations::table
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                .select(users_organizations::org_uuid)
-                .load::<OrganizationId>(conn)
-                .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user_and_policy(user_uuid: &UserId, policy_type: OrgPolicyType, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .inner_join(
-                    org_policies::table.on(
-                        org_policies::org_uuid.eq(users_organizations::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid))
-                            .and(org_policies::atype.eq(policy_type as i32))
-                            .and(org_policies::enabled.eq(true)))
+                    org_policies::table.on(org_policies::org_uuid
+                        .eq(users_organizations::org_uuid)
+                        .and(users_organizations::user_uuid.eq(user_uuid))
+                        .and(org_policies::atype.eq(policy_type as i32))
+                        .and(org_policies::enabled.eq(true))),
                 )
-                .filter(
-                    users_organizations::status.eq(MembershipStatus::Confirmed as i32)
-                )
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .select(users_organizations::all_columns)
                 .load::<Self>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_cipher_and_org(cipher_uuid: &CipherId, org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
-            .filter(users_organizations::org_uuid.eq(org_uuid))
-            .left_join(users_collections::table.on(
-                users_collections::user_uuid.eq(users_organizations::user_uuid)
-            ))
-            .left_join(ciphers_collections::table.on(
-                ciphers_collections::collection_uuid.eq(users_collections::collection_uuid).and(
-                    ciphers_collections::cipher_uuid.eq(&cipher_uuid)
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .left_join(users_collections::table.on(users_collections::user_uuid.eq(users_organizations::user_uuid)))
+                .left_join(
+                    ciphers_collections::table.on(ciphers_collections::collection_uuid
+                        .eq(users_collections::collection_uuid)
+                        .and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))),
                 )
-            ))
-            .filter(
-                users_organizations::access_all.eq(true).or( // AccessAll..
-                    ciphers_collections::cipher_uuid.eq(&cipher_uuid) // ..or access to collection with cipher
-                )
-            )
-            .select(users_organizations::all_columns)
-            .distinct()
-            .load::<Self>(conn)
-            .expect("Error loading user organizations")
-        }}
+                .filter(users_organizations::access_all.eq(true).or(
+                    // AccessAll..
+                    ciphers_collections::cipher_uuid.eq(&cipher_uuid), // ..or access to collection with cipher
+                ))
+                .select(users_organizations::all_columns)
+                .distinct()
+                .load::<Self>(conn)
+                .expect("Error loading user organizations")
+        })
+        .await
     }
 
     pub async fn find_by_cipher_and_org_with_group(
@@ -1065,45 +1049,56 @@ impl Membership {
         org_uuid: &OrganizationId,
         conn: &DbConn,
     ) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
-            .filter(users_organizations::org_uuid.eq(org_uuid))
-            .inner_join(groups_users::table.on(
-                groups_users::users_organizations_uuid.eq(users_organizations::uuid)
-            ))
-            .left_join(collections_groups::table.on(
-                collections_groups::groups_uuid.eq(groups_users::groups_uuid)
-            ))
-            .left_join(groups::table.on(groups::uuid.eq(groups_users::groups_uuid)
-                .and(groups::organizations_uuid.eq(users_organizations::org_uuid))
-            ))
-            .left_join(ciphers_collections::table.on(
-                    ciphers_collections::collection_uuid.eq(collections_groups::collections_uuid).and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))
-
-                ))
-            .filter(
-                    groups::access_all.eq(true).or( // AccessAll via groups
-                        ciphers_collections::cipher_uuid.eq(&cipher_uuid) // ..or access to collection via group
-                    )
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .inner_join(
+                    groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)),
                 )
+                .left_join(collections_groups::table.on(collections_groups::groups_uuid.eq(groups_users::groups_uuid)))
+                .left_join(
+                    groups::table.on(groups::uuid
+                        .eq(groups_users::groups_uuid)
+                        .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
+                )
+                .left_join(
+                    ciphers_collections::table.on(ciphers_collections::collection_uuid
+                        .eq(collections_groups::collections_uuid)
+                        .and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))),
+                )
+                .filter(groups::access_all.eq(true).or(
+                    // AccessAll via groups
+                    ciphers_collections::cipher_uuid.eq(&cipher_uuid), // ..or access to collection via group
+                ))
                 .select(users_organizations::all_columns)
                 .distinct()
-            .load::<Self>(conn)
-            .expect("Error loading user organizations with groups")
-        }}
+                .load::<Self>(conn)
+                .expect("Error loading user organizations with groups")
+        })
+        .await
     }
 
     pub async fn user_has_ge_admin_access_to_cipher(user_uuid: &UserId, cipher_uuid: &CipherId, conn: &DbConn) -> bool {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
-            .inner_join(ciphers::table.on(ciphers::uuid.eq(cipher_uuid).and(ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable()))))
-            .filter(users_organizations::user_uuid.eq(user_uuid))
-            .filter(users_organizations::atype.eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32]))
-            .count()
-            .first::<i64>(conn)
-            .ok()
-            .unwrap_or(0) != 0
-        }}
+                .inner_join(
+                    ciphers::table.on(ciphers::uuid
+                        .eq(cipher_uuid)
+                        .and(ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable()))),
+                )
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .filter(
+                    users_organizations::atype.eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32]),
+                )
+                .count()
+                .first::<i64>(conn)
+                .ok()
+                .unwrap_or(0)
+                != 0
+        })
+        .await
     }
 
     pub async fn find_by_collection_and_org(
@@ -1111,69 +1106,57 @@ impl Membership {
         org_uuid: &OrganizationId,
         conn: &DbConn,
     ) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
-            .filter(users_organizations::org_uuid.eq(org_uuid))
-            .left_join(users_collections::table.on(
-                users_collections::user_uuid.eq(users_organizations::user_uuid)
-            ))
-            .filter(
-                users_organizations::access_all.eq(true).or( // AccessAll..
-                    users_collections::collection_uuid.eq(&collection_uuid) // ..or access to collection with cipher
-                )
-            )
-            .select(users_organizations::all_columns)
-            .load::<Self>(conn)
-            .expect("Error loading user organizations")
-        }}
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .left_join(users_collections::table.on(users_collections::user_uuid.eq(users_organizations::user_uuid)))
+                .filter(users_organizations::access_all.eq(true).or(
+                    // AccessAll..
+                    users_collections::collection_uuid.eq(&collection_uuid), // ..or access to collection with cipher
+                ))
+                .select(users_organizations::all_columns)
+                .load::<Self>(conn)
+                .expect("Error loading user organizations")
+        })
+        .await
     }
 
     pub async fn find_by_external_id_and_org(ext_id: &str, org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
-            .filter(
-                users_organizations::external_id.eq(ext_id)
-                .and(users_organizations::org_uuid.eq(org_uuid))
-            )
-            .first::<Self>(conn)
-            .ok()
-        }}
+                .filter(users_organizations::external_id.eq(ext_id).and(users_organizations::org_uuid.eq(org_uuid)))
+                .first::<Self>(conn)
+                .ok()
+        })
+        .await
     }
 
     pub async fn find_main_user_org(user_uuid: &str, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
                 .order(users_organizations::atype.asc())
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 }
 
 impl OrganizationApiKey {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(organization_api_key::table)
+            mysql {
+                diesel::insert_into(organization_api_key::table)
                     .values(self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(self)
                     .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(organization_api_key::table)
-                            .filter(organization_api_key::uuid.eq(&self.uuid))
-                            .set(self)
-                            .execute(conn)
-                            .map_res("Error saving organization")
-                    }
-                    Err(e) => Err(e.into()),
-                }.map_res("Error saving organization")
-
+                    .map_res("Error saving organization")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(organization_api_key::table)
                     .values(self)
                     .on_conflict((organization_api_key::uuid, organization_api_key::org_uuid))
@@ -1186,20 +1169,19 @@ impl OrganizationApiKey {
     }
 
     pub async fn find_by_org_uuid(org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            organization_api_key::table
-                .filter(organization_api_key::org_uuid.eq(org_uuid))
-                .first::<Self>(conn)
-                .ok()
-        }}
+        conn.run(move |conn| {
+            organization_api_key::table.filter(organization_api_key::org_uuid.eq(org_uuid)).first::<Self>(conn).ok()
+        })
+        .await
     }
 
     pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(organization_api_key::table.filter(organization_api_key::org_uuid.eq(org_uuid)))
                 .execute(conn)
                 .map_res("Error removing organization api key from organization")
-        }}
+        })
+        .await
     }
 }
 

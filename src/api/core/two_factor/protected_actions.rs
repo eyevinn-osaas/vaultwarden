@@ -1,16 +1,17 @@
-use chrono::{naive::serde::ts_seconds, NaiveDateTime, TimeDelta, Utc};
-use rocket::{serde::json::Json, Route};
+use chrono::{NaiveDateTime, TimeDelta, Utc, naive::serde::ts_seconds};
+use rocket::{Route, serde::json::Json};
 
 use crate::{
+    CONFIG,
     api::EmptyResult,
     auth::Headers,
     crypto,
     db::{
-        models::{TwoFactor, TwoFactorType, UserId},
         DbConn,
+        models::{TwoFactor, TwoFactorType, UserId},
     },
     error::{Error, MapResult},
-    mail, CONFIG,
+    mail,
 };
 
 pub fn routes() -> Vec<Route> {
@@ -44,9 +45,10 @@ impl ProtectedActionData {
 
     pub fn from_json(string: &str) -> Result<Self, Error> {
         let res: Result<Self, serde_json::Error> = serde_json::from_str(string);
-        match res {
-            Ok(x) => Ok(x),
-            Err(_) => err!("Could not decode ProtectedActionData from string"),
+        if let Ok(x) = res {
+            Ok(x)
+        } else {
+            err!("Could not decode ProtectedActionData from string")
         }
     }
 
@@ -62,14 +64,15 @@ impl ProtectedActionData {
 #[post("/accounts/request-otp")]
 async fn request_otp(headers: Headers, conn: DbConn) -> EmptyResult {
     if !CONFIG.mail_enabled() {
-        err!("Email is disabled for this server. Either enable email or login using your master password instead of login via device.");
+        err!(
+            "Email is disabled for this server. Either enable email or login using your master password instead of login via device."
+        );
     }
 
     let user = headers.user;
 
     // Only one Protected Action per user is allowed to take place, delete the previous one
-    if let Some(pa) = TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::ProtectedActions as i32, &conn).await
-    {
+    if let Some(pa) = TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::ProtectedActions, &conn).await {
         let pa_data = ProtectedActionData::from_json(&pa.data)?;
         let elapsed = pa_data.time_since_sent().num_seconds();
         let delay = 30;
@@ -102,7 +105,9 @@ struct ProtectedActionVerify {
 #[post("/accounts/verify-otp", data = "<data>")]
 async fn verify_otp(data: Json<ProtectedActionVerify>, headers: Headers, conn: DbConn) -> EmptyResult {
     if !CONFIG.mail_enabled() {
-        err!("Email is disabled for this server. Either enable email or login using your master password instead of login via device.");
+        err!(
+            "Email is disabled for this server. Either enable email or login using your master password instead of login via device."
+        );
     }
 
     let user = headers.user;
@@ -119,27 +124,28 @@ pub async fn validate_protected_action_otp(
     delete_if_valid: bool,
     conn: &DbConn,
 ) -> EmptyResult {
-    let mut pa = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::ProtectedActions as i32, conn)
+    let mut pa = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::ProtectedActions, conn)
         .await
         .map_res("Protected action token not found, try sending the code again or restart the process")?;
     let mut pa_data = ProtectedActionData::from_json(&pa.data)?;
-    pa_data.add_attempt();
-    pa.data = pa_data.to_json();
 
     // Fail after x attempts if the token has been used too many times.
     // Don't delete it, as we use it to keep track of attempts.
-    if pa_data.attempts >= CONFIG.email_attempts_limit() {
+    if pa_data.attempts >= u64::from(CONFIG.email_attempts_limit()) {
         err!("Token has expired")
     }
 
     // Check if the token has expired (Using the email 2fa expiration time)
-    let max_time = CONFIG.email_expiration_time() as i64;
+    let max_time = i64::from(CONFIG.email_expiration_time());
     if pa_data.time_since_sent().num_seconds() > max_time {
         pa.delete(conn).await?;
         err!("Token has expired")
     }
 
     if !crypto::ct_eq(&pa_data.token, otp) {
+        pa_data.add_attempt();
+        pa.data = pa_data.to_json();
+
         pa.save(conn).await?;
         err!("Token is invalid")
     }

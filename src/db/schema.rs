@@ -116,6 +116,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
+        revision_date -> Timestamp,
     }
 }
 
@@ -217,6 +218,7 @@ table! {
         api_key -> Nullable<Text>,
         avatar_color -> Nullable<Text>,
         external_id -> Nullable<Text>,
+        key_id -> Nullable<Text>,
     }
 }
 
@@ -262,6 +264,7 @@ table! {
         nonce -> Text,
         redirect_uri -> Text,
         code_response -> Nullable<Text>,
+        code_response_error -> Nullable<Text>,
         auth_response -> Nullable<Text>,
         created_at -> Timestamp,
         updated_at -> Timestamp,

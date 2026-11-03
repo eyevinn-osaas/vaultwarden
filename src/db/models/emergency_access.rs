@@ -1,12 +1,16 @@
-use chrono::{NaiveDateTime, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use derive_more::{AsRef, Deref, Display, From};
+use diesel::prelude::*;
 use serde_json::Value;
 
-use super::{User, UserId};
-use crate::db::schema::emergency_access;
-use crate::{api::EmptyResult, db::DbConn, error::MapResult};
-use diesel::prelude::*;
+use crate::{
+    api::EmptyResult,
+    db::{DbConn, schema::emergency_access},
+    error::MapResult,
+};
 use macros::UuidFromParam;
+
+use super::{User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = emergency_access)]
@@ -87,13 +91,12 @@ impl EmergencyAccess {
             User::find_by_uuid(grantee_uuid, conn).await.expect("Grantee user not found.")
         } else {
             let email = self.email.as_deref()?;
-            match User::find_by_mail(email, conn).await {
-                Some(user) => user,
-                None => {
-                    // remove outstanding invitations which should not exist
-                    Self::delete_all_by_grantee_email(email, conn).await.ok();
-                    return None;
-                }
+            if let Some(user) = User::find_by_mail(email, conn).await {
+                user
+            } else {
+                // remove outstanding invitations which should not exist
+                Self::delete_all_by_grantee_email(email, conn).await.ok();
+                return None;
             }
         };
 
@@ -109,7 +112,25 @@ impl EmergencyAccess {
             "object": "emergencyAccessGranteeDetails",
         }))
     }
+
+    pub fn deadline_at(&self) -> Result<NaiveDateTime, crate::Error> {
+        if !(EMERGENCY_ACCESS_TIMEOUT_RANGE).contains(&self.wait_time_days) {
+            err!("Emergency access wait time is out-of-bounds!")
+        }
+
+        let initiated_at = self.recovery_initiated_at.map_res("Emergency access initiation date missing!")?;
+
+        TimeDelta::try_days(i64::from(self.wait_time_days))
+            .and_then(|w| initiated_at.checked_add_signed(w))
+            .map_res("Emergency access deadline is invalid")
+    }
+
+    pub fn is_recovery_allowed(&self, now: &NaiveDateTime) -> Result<bool, crate::Error> {
+        Ok(self.deadline_at()?.le(now))
+    }
 }
+
+pub const EMERGENCY_ACCESS_TIMEOUT_RANGE: std::ops::RangeInclusive<i32> = 1..=90;
 
 #[derive(Copy, Clone)]
 pub enum EmergencyAccessType {
@@ -143,24 +164,16 @@ impl EmergencyAccess {
         self.updated_at = Utc::now().naive_utc();
 
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(emergency_access::table)
+            mysql {
+                diesel::insert_into(emergency_access::table)
                     .values(&*self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(&*self)
                     .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(emergency_access::table)
-                            .filter(emergency_access::uuid.eq(&self.uuid))
-                            .set(&*self)
-                            .execute(conn)
-                            .map_res("Error updating emergency access")
-                    }
-                    Err(e) => Err(e.into()),
-                }.map_res("Error saving emergency access")
+                    .map_res("Error saving emergency access")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(emergency_access::table)
                     .values(&*self)
                     .on_conflict(emergency_access::uuid)
@@ -174,37 +187,60 @@ impl EmergencyAccess {
 
     pub async fn update_access_status_and_save(
         &mut self,
-        status: i32,
+        from_status: i32,
+        to_status: i32,
         date: &NaiveDateTime,
         conn: &DbConn,
     ) -> EmptyResult {
+        let uuid = self.uuid.clone();
+        let updated_at = *date;
+        let res = conn
+            .run(move |conn| {
+                crate::util::retry(
+                    || {
+                        diesel::update(
+                            emergency_access::table
+                                .filter(emergency_access::uuid.eq(&uuid))
+                                .filter(emergency_access::status.eq(from_status)),
+                        )
+                        .set((emergency_access::status.eq(to_status), emergency_access::updated_at.eq(updated_at)))
+                        .execute(conn)
+                    },
+                    10,
+                )
+            })
+            .await;
+
+        match res {
+            Ok(1) => {} // One record updated, which is valid
+            Ok(_) => err!("Emergency access status was changed already"),
+            Err(e) => err!("Error updating emergency access status", format!("{e}")),
+        }
+
+        self.status = to_status;
+        self.updated_at = updated_at;
+
         // Update the grantee so that it will refresh it's status.
         User::update_uuid_revision(self.grantee_uuid.as_ref().expect("Error getting grantee"), conn).await;
-        self.status = status;
-        date.clone_into(&mut self.updated_at);
-
-        db_run! { conn: {
-            crate::util::retry(|| {
-                diesel::update(emergency_access::table.filter(emergency_access::uuid.eq(&self.uuid)))
-                    .set((emergency_access::status.eq(status), emergency_access::updated_at.eq(date)))
-                    .execute(conn)
-            }, 10)
-            .map_res("Error updating emergency access status")
-        }}
+        Ok(())
     }
 
     pub async fn update_last_notification_date_and_save(&mut self, date: &NaiveDateTime, conn: &DbConn) -> EmptyResult {
         self.last_notification_at = Some(date.to_owned());
         date.clone_into(&mut self.updated_at);
 
-        db_run! { conn: {
-            crate::util::retry(|| {
-                diesel::update(emergency_access::table.filter(emergency_access::uuid.eq(&self.uuid)))
-                    .set((emergency_access::last_notification_at.eq(date), emergency_access::updated_at.eq(date)))
-                    .execute(conn)
-            }, 10)
+        conn.run(move |conn| {
+            crate::util::retry(
+                || {
+                    diesel::update(emergency_access::table.filter(emergency_access::uuid.eq(&self.uuid)))
+                        .set((emergency_access::last_notification_at.eq(date), emergency_access::updated_at.eq(date)))
+                        .execute(conn)
+                },
+                10,
+            )
             .map_res("Error updating emergency access status")
-        }}
+        })
+        .await
     }
 
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -227,11 +263,12 @@ impl EmergencyAccess {
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         User::update_uuid_revision(&self.grantor_uuid, conn).await;
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(emergency_access::table.filter(emergency_access::uuid.eq(self.uuid)))
                 .execute(conn)
                 .map_res("Error removing user from emergency access")
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_grantor_uuid_and_grantee_uuid_or_email(
@@ -240,23 +277,25 @@ impl EmergencyAccess {
         email: &str,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::grantor_uuid.eq(grantor_uuid))
                 .filter(emergency_access::grantee_uuid.eq(grantee_uuid).or(emergency_access::email.eq(email)))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_all_recoveries_initiated(conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::status.eq(EmergencyAccessStatus::RecoveryInitiated as i32))
                 .filter(emergency_access::recovery_initiated_at.is_not_null())
                 .load::<Self>(conn)
                 .expect("Error loading emergency_access")
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_uuid_and_grantor_uuid(
@@ -264,13 +303,14 @@ impl EmergencyAccess {
         grantor_uuid: &UserId,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::uuid.eq(uuid))
                 .filter(emergency_access::grantor_uuid.eq(grantor_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_uuid_and_grantee_uuid(
@@ -278,13 +318,14 @@ impl EmergencyAccess {
         grantee_uuid: &UserId,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::uuid.eq(uuid))
                 .filter(emergency_access::grantee_uuid.eq(grantee_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_uuid_and_grantee_email(
@@ -292,61 +333,67 @@ impl EmergencyAccess {
         grantee_email: &str,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::uuid.eq(uuid))
                 .filter(emergency_access::email.eq(grantee_email))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_all_by_grantee_uuid(grantee_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::grantee_uuid.eq(grantee_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading emergency_access")
-        }}
+        })
+        .await
     }
 
     pub async fn find_invited_by_grantee_email(grantee_email: &str, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::email.eq(grantee_email))
                 .filter(emergency_access::status.eq(EmergencyAccessStatus::Invited as i32))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_all_invited_by_grantee_email(grantee_email: &str, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::email.eq(grantee_email))
                 .filter(emergency_access::status.eq(EmergencyAccessStatus::Invited as i32))
                 .load::<Self>(conn)
                 .expect("Error loading emergency_access")
-        }}
+        })
+        .await
     }
 
     pub async fn find_all_by_grantor_uuid(grantor_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::grantor_uuid.eq(grantor_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading emergency_access")
-        }}
+        })
+        .await
     }
 
     pub async fn find_all_confirmed_by_grantor_uuid(grantor_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             emergency_access::table
                 .filter(emergency_access::grantor_uuid.eq(grantor_uuid))
                 .filter(emergency_access::status.ge(EmergencyAccessStatus::Confirmed as i32))
                 .load::<Self>(conn)
                 .expect("Error loading emergency_access")
-        }}
+        })
+        .await
     }
 
     pub async fn accept_invite(&mut self, grantee_uuid: &UserId, grantee_email: &str, conn: &DbConn) -> EmptyResult {

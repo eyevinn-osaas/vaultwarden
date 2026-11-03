@@ -6,28 +6,29 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use futures::{stream::StreamExt, TryFutureExt};
+use futures::{TryFutureExt, stream::StreamExt};
 use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 use regex::Regex;
 use reqwest::{
-    header::{self, HeaderMap, HeaderValue},
     Client, Response,
+    header::{self, HeaderMap, HeaderValue},
 };
-use rocket::{http::ContentType, response::Redirect, Route};
-use svg_hush::{data_url_filter, Filter};
+use rocket::{Route, http::ContentType, response::Redirect};
+use svg_hush::{Filter, data_url_filter};
 
 use crate::{
+    CONFIG,
     config::PathType,
     error::Error,
-    http_client::{get_reqwest_client_builder, get_valid_host, should_block_host, CustomHttpClientError},
+    http_client::{CustomHttpClientError, get_reqwest_client_builder, get_valid_host, should_block_host},
     util::Cached,
-    CONFIG,
 };
 
 pub fn routes() -> Vec<Route> {
-    match CONFIG.icon_service().as_str() {
-        "internal" => routes![icon_internal],
-        _ => routes![icon_external],
+    if CONFIG.icon_service().as_str() == "internal" {
+        routes![icon_internal]
+    } else {
+        routes![icon_external]
     }
 }
 
@@ -61,10 +62,10 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
     // Generate the cookie store
     let cookie_store = Arc::new(Jar::default());
 
-    let icon_download_timeout = Duration::from_secs(CONFIG.icon_download_timeout());
+    let icon_download_timeout = Duration::from_secs(u64::from(CONFIG.icon_download_timeout()));
     let pool_idle_timeout = Duration::from_secs(10);
     // Reuse the client between requests
-    get_reqwest_client_builder()
+    get_reqwest_client_builder(true)
         .cookie_provider(Arc::clone(&cookie_store))
         .timeout(icon_download_timeout)
         .pool_max_idle_per_host(5) // Configure the Hyper Pool to only have max 5 idle connections
@@ -84,7 +85,7 @@ static ICON_SIZE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?x)(\d+
 #[get("/<host>/icon.png")]
 fn icon_external(host: &str) -> Cached<Option<Redirect>> {
     let Ok(host) = get_valid_host(host) else {
-        warn!("Invalid host: {host}");
+        warn!("Invalid host: {}", host.escape_debug());
         return Cached::ttl(None, CONFIG.icon_cache_negttl(), true);
     };
 
@@ -112,7 +113,7 @@ async fn icon_internal(host: &str) -> Cached<(ContentType, Vec<u8>)> {
     const FALLBACK_ICON: &[u8] = include_bytes!("../static/images/fallback-icon.png");
 
     let Ok(host) = get_valid_host(host) else {
-        warn!("Invalid host: {host}");
+        warn!("Invalid host: {}", host.escape_debug());
         return Cached::ttl(
             (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
             CONFIG.icon_cache_negttl(),
@@ -147,7 +148,7 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
 
     if let Some(icon) = get_cached_icon(&path).await {
         let icon_type = get_icon_type(&icon).unwrap_or("x-icon");
-        return Some((icon, icon_type.to_string()));
+        return Some((icon, icon_type.to_owned()));
     }
 
     if CONFIG.disable_icon_download() {
@@ -158,7 +159,7 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
     match download_icon(domain).await {
         Ok((icon, icon_type)) => {
             save_icon(&path, icon.to_vec()).await;
-            Some((icon.to_vec(), icon_type.unwrap_or("x-icon").to_string()))
+            Some((icon.to_vec(), icon_type.unwrap_or("x-icon").to_owned()))
         }
         Err(e) => {
             // If this error comes from the custom resolver, this means this is a blocked domain
@@ -183,23 +184,23 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
     }
 
     // Try to read the cached icon, and return it if it exists
-    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
-        if let Ok(buf) = operator.read(path).await {
-            return Some(buf.to_vec());
-        }
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::IconCache)
+        && let Ok(buf) = operator.read(path).await
+    {
+        return Some(buf.to_vec());
     }
 
     None
 }
 
-async fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
+async fn file_is_expired(path: &str, ttl: u32) -> Result<bool, Error> {
     let operator = CONFIG.opendal_operator_for_path_type(&PathType::IconCache)?;
     let meta = operator.stat(path).await?;
     let modified =
         meta.last_modified().ok_or_else(|| std::io::Error::other(format!("No last modified time for `{path}`")))?;
     let age = SystemTime::now().duration_since(modified.into())?;
 
-    Ok(ttl > 0 && ttl <= age.as_secs())
+    Ok(ttl > 0 && u64::from(ttl) <= age.as_secs())
 }
 
 async fn icon_is_negcached(path: &str) -> bool {
@@ -263,7 +264,7 @@ fn get_favicons_node(dom: Tokenizer<StringReader<'_>, FaviconEmitter>, icons: &m
             TAG_BASE => {
                 base_url = if let Some(href) = token.tag.attributes.get(ATTR_HREF) {
                     let href = std::str::from_utf8(href).unwrap_or_default();
-                    debug!("Found base href: {href}");
+                    debug!("Found base href: {}", href.escape_debug());
                     match base_url.join(href) {
                         Ok(inner_url) => inner_url,
                         _ => continue,
@@ -280,17 +281,17 @@ fn get_favicons_node(dom: Tokenizer<StringReader<'_>, FaviconEmitter>, icons: &m
     }
 
     for icon_tag in icon_tags {
-        if let Some(icon_href) = icon_tag.attributes.get(ATTR_HREF) {
-            if let Ok(full_href) = base_url.join(std::str::from_utf8(icon_href).unwrap_or_default()) {
-                let sizes = if let Some(v) = icon_tag.attributes.get(ATTR_SIZES) {
-                    std::str::from_utf8(v).unwrap_or_default()
-                } else {
-                    ""
-                };
-                let priority = get_icon_priority(full_href.as_str(), sizes);
-                icons.push(Icon::new(priority, full_href.to_string()));
-            }
-        };
+        if let Some(icon_href) = icon_tag.attributes.get(ATTR_HREF)
+            && let Ok(full_href) = base_url.join(std::str::from_utf8(icon_href).unwrap_or_default())
+        {
+            let sizes = if let Some(v) = icon_tag.attributes.get(ATTR_SIZES) {
+                std::str::from_utf8(v).unwrap_or_default()
+            } else {
+                ""
+            };
+            let priority = get_icon_priority(full_href.as_str(), sizes);
+            icons.push(Icon::new(priority, full_href.to_string()));
+        }
     }
 }
 
@@ -404,9 +405,25 @@ async fn get_page(url: &str) -> Result<Response, Error> {
 }
 
 async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Error> {
+    // The resolver only sees hosts needing name resolution, so IP-literal hrefs from
+    // attacker-controlled HTML never reach `post_resolve()`. Check them here.
+    let Ok(parsed_url) = url::Url::parse(url) else {
+        err_silent!("Invalid URL", url)
+    };
+
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        err_silent!("Invalid scheme", url)
+    }
+
+    let Some(host) = parsed_url.host() else {
+        err_silent!("Invalid host", url)
+    };
+
+    should_block_host(&host)?;
+
     let mut client = CLIENT.get(url);
     if !referer.is_empty() {
-        client = client.header("Referer", referer)
+        client = client.header("Referer", referer);
     }
 
     Ok(client.send().await?.error_for_status()?)
@@ -494,12 +511,10 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
     let mut buffer = Bytes::new();
     let mut icon_type: Option<&str> = None;
 
-    use data_url::DataUrl;
-
     let mut icons = icon_result.iconlist.iter().take(5).peekable();
     while let Some(icon) = icons.next() {
         if icon.href.starts_with("data:image") {
-            let Ok(datauri) = DataUrl::process(&icon.href) else {
+            let Ok(datauri) = data_url::DataUrl::process(&icon.href) else {
                 continue;
             };
             // Check if we are able to decode the data uri
@@ -509,7 +524,7 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
                 Ok(())
             }) {
                 Ok(_) => {
-                    // Also check if the size is atleast 67 bytes, which seems to be the smallest png i could create
+                    // Also check if the size is at least 67 bytes, which seems to be the smallest png I could create
                     if body.len() >= 67 {
                         // Check if the icon type is allowed, else try an icon from the list.
                         icon_type = get_icon_type(&body);
@@ -523,7 +538,7 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
                     }
                 }
                 _ => debug!("Extracted icon from data:image uri is invalid"),
-            };
+            }
         } else {
             debug!("Trying {}", icon.href);
             // Make sure all icons are checked before returning error
@@ -587,10 +602,10 @@ async fn save_icon(path: &str, icon: Vec<u8>) {
 fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
     fn check_svg_after_xml_declaration(bytes: &[u8]) -> Option<&'static str> {
         // Look for SVG tag within the first 1KB
-        if let Ok(content) = std::str::from_utf8(&bytes[..bytes.len().min(1024)]) {
-            if content.contains("<svg") || content.contains("<SVG") {
-                return Some("svg+xml");
-            }
+        if let Ok(content) = std::str::from_utf8(&bytes[..bytes.len().min(1024)])
+            && (content.contains("<svg") || content.contains("<SVG"))
+        {
+            return Some("svg+xml");
         }
         None
     }
@@ -648,6 +663,17 @@ impl reqwest::cookie::CookieStore for Jar {
         use time::Duration;
 
         let mut cookie_store = self.0.write().unwrap();
+
+        // The store only skips expired cookies when reading them, so remove them here or they are kept forever
+        let expired: Vec<_> = cookie_store
+            .iter_any()
+            .filter(|c| c.is_expired())
+            .map(|c| (String::from(&c.domain), String::from(&c.path), c.name().to_owned()))
+            .collect();
+        for (domain, path, name) in expired {
+            cookie_store.remove(&domain, &path, &name);
+        }
+
         let cookies = cookie_headers.filter_map(|val| {
             std::str::from_utf8(val.as_bytes())
                 .map_err(RawCookieParseError::from)
@@ -733,7 +759,7 @@ impl FaviconEmitter {
                     let rel_value =
                         std::str::from_utf8(token.tag.attributes.get(ATTR_REL).unwrap()).unwrap_or_default();
                     if rel_value.contains("icon") && !rel_value.contains("mask-icon") {
-                        self.emit_token = true
+                        self.emit_token = true;
                     }
                 }
                 _ => (),
@@ -806,13 +832,13 @@ impl Emitter for FaviconEmitter {
 
     fn push_attribute_name(&mut self, s: &[u8]) {
         if let Some(attr) = &mut self.current_attribute {
-            attr.0.extend(s)
+            attr.0.extend(s);
         }
     }
 
     fn push_attribute_value(&mut self, s: &[u8]) {
         if let Some(attr) = &mut self.current_attribute {
-            attr.1.extend(s)
+            attr.1.extend(s);
         }
     }
 

@@ -1,11 +1,19 @@
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, Deref, Display, From};
+use diesel::prelude::*;
 use serde_json::Value;
 
-use super::{CipherId, User, UserId};
-use crate::db::schema::{folders, folders_ciphers};
-use diesel::prelude::*;
+use crate::{
+    api::EmptyResult,
+    db::{
+        DbConn,
+        schema::{folders, folders_ciphers},
+    },
+    error::MapResult,
+};
 use macros::UuidFromParam;
+
+use super::{CipherId, User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = folders)]
@@ -56,16 +64,11 @@ impl Folder {
 impl FolderCipher {
     pub fn new(folder_uuid: FolderId, cipher_uuid: CipherId) -> Self {
         Self {
-            folder_uuid,
             cipher_uuid,
+            folder_uuid,
         }
     }
 }
-
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
 
 /// Database methods
 impl Folder {
@@ -74,24 +77,16 @@ impl Folder {
         self.updated_at = Utc::now().naive_utc();
 
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(folders::table)
+            mysql {
+                diesel::insert_into(folders::table)
                     .values(&*self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(&*self)
                     .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(folders::table)
-                            .filter(folders::uuid.eq(&self.uuid))
-                            .set(&*self)
-                            .execute(conn)
-                            .map_res("Error saving folder")
-                    }
-                    Err(e) => Err(e.into()),
-                }.map_res("Error saving folder")
+                    .map_res("Error saving folder")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(folders::table)
                     .values(&*self)
                     .on_conflict(folders::uuid)
@@ -107,11 +102,12 @@ impl Folder {
         User::update_uuid_revision(&self.user_uuid, conn).await;
         FolderCipher::delete_all_by_folder(&self.uuid, conn).await?;
 
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(folders::table.filter(folders::uuid.eq(&self.uuid)))
                 .execute(conn)
                 .map_res("Error deleting folder")
-        }}
+        })
+        .await
     }
 
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -122,38 +118,36 @@ impl Folder {
     }
 
     pub async fn find_by_uuid_and_user(uuid: &FolderId, user_uuid: &UserId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             folders::table
                 .filter(folders::uuid.eq(uuid))
                 .filter(folders::user_uuid.eq(user_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
-            folders::table
-                .filter(folders::user_uuid.eq(user_uuid))
-                .load::<Self>(conn)
-                .expect("Error loading folders")
-        }}
+        conn.run(move |conn| {
+            folders::table.filter(folders::user_uuid.eq(user_uuid)).load::<Self>(conn).expect("Error loading folders")
+        })
+        .await
     }
 }
 
 impl FolderCipher {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
-            sqlite, mysql {
-                // Not checking for ForeignKey Constraints here.
-                // Table folders_ciphers does not have ForeignKey Constraints which would cause conflicts.
-                // This table has no constraints pointing to itself, but only to others.
-                diesel::replace_into(folders_ciphers::table)
+            mysql {
+                diesel::insert_into(folders_ciphers::table)
                     .values(self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_nothing()
                     .execute(conn)
                     .map_res("Error adding cipher to folder")
             }
-            postgresql {
+            postgresql, sqlite {
                 diesel::insert_into(folders_ciphers::table)
                     .values(self)
                     .on_conflict((folders_ciphers::cipher_uuid, folders_ciphers::folder_uuid))
@@ -165,7 +159,7 @@ impl FolderCipher {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(
                 folders_ciphers::table
                     .filter(folders_ciphers::cipher_uuid.eq(self.cipher_uuid))
@@ -173,23 +167,26 @@ impl FolderCipher {
             )
             .execute(conn)
             .map_res("Error removing cipher from folder")
-        }}
+        })
+        .await
     }
 
     pub async fn delete_all_by_cipher(cipher_uuid: &CipherId, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(folders_ciphers::table.filter(folders_ciphers::cipher_uuid.eq(cipher_uuid)))
                 .execute(conn)
                 .map_res("Error removing cipher from folders")
-        }}
+        })
+        .await
     }
 
     pub async fn delete_all_by_folder(folder_uuid: &FolderId, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(folders_ciphers::table.filter(folders_ciphers::folder_uuid.eq(folder_uuid)))
                 .execute(conn)
                 .map_res("Error removing ciphers from folder")
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_folder_and_cipher(
@@ -197,35 +194,38 @@ impl FolderCipher {
         cipher_uuid: &CipherId,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             folders_ciphers::table
                 .filter(folders_ciphers::folder_uuid.eq(folder_uuid))
                 .filter(folders_ciphers::cipher_uuid.eq(cipher_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_folder(folder_uuid: &FolderId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             folders_ciphers::table
                 .filter(folders_ciphers::folder_uuid.eq(folder_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading folders")
-        }}
+        })
+        .await
     }
 
     /// Return a vec with (cipher_uuid, folder_uuid)
     /// This is used during a full sync so we only need one query for all folder matches.
     pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<(CipherId, FolderId)> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             folders_ciphers::table
                 .inner_join(folders::table)
                 .filter(folders::user_uuid.eq(user_uuid))
                 .select(folders_ciphers::all_columns)
                 .load::<(CipherId, FolderId)>(conn)
                 .unwrap_or_default()
-        }}
+        })
+        .await
     }
 }
 

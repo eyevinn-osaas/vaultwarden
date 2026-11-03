@@ -1,11 +1,18 @@
-use super::{DeviceId, OrganizationId, UserId};
-use crate::db::schema::auth_requests;
-use crate::{crypto::ct_eq, util::format_date};
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
-use macros::UuidFromParam;
 use serde_json::Value;
+
+use crate::{
+    api::{ApiResult, EmptyResult},
+    crypto::ct_eq,
+    db::{DbConn, schema::auth_requests},
+    error::MapResult,
+    util::format_date,
+};
+use macros::UuidFromParam;
+
+use super::{DeviceId, OrganizationId, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset, Deserialize, Serialize)]
 #[diesel(table_name = auth_requests)]
@@ -74,37 +81,24 @@ impl AuthRequest {
     }
 }
 
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
 impl AuthRequest {
-    pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
-            sqlite, mysql {
-                match diesel::replace_into(auth_requests::table)
-                    .values(&*self)
-                    .execute(conn)
-                {
-                    Ok(_) => Ok(()),
-                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
-                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
-                        diesel::update(auth_requests::table)
-                            .filter(auth_requests::uuid.eq(&self.uuid))
-                            .set(&*self)
-                            .execute(conn)
-                            .map_res("Error auth_request")
-                    }
-                    Err(e) => Err(e.into()),
-                }.map_res("Error auth_request")
-            }
-            postgresql {
+            mysql {
                 diesel::insert_into(auth_requests::table)
-                    .values(&*self)
+                    .values(self)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(self)
+                    .execute(conn)
+                    .map_res("Error saving auth_request")
+            }
+            postgresql, sqlite {
+                diesel::insert_into(auth_requests::table)
+                    .values(self)
                     .on_conflict(auth_requests::uuid)
                     .do_update()
-                    .set(&*self)
+                    .set(self)
                     .execute(conn)
                     .map_res("Error saving auth_request")
             }
@@ -112,31 +106,28 @@ impl AuthRequest {
     }
 
     pub async fn find_by_uuid(uuid: &AuthRequestId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            auth_requests::table
-                .filter(auth_requests::uuid.eq(uuid))
-                .first::<Self>(conn)
-                .ok()
-        }}
+        conn.run(move |conn| auth_requests::table.filter(auth_requests::uuid.eq(uuid)).first::<Self>(conn).ok()).await
     }
 
     pub async fn find_by_uuid_and_user(uuid: &AuthRequestId, user_uuid: &UserId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             auth_requests::table
                 .filter(auth_requests::uuid.eq(uuid))
                 .filter(auth_requests::user_uuid.eq(user_uuid))
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             auth_requests::table
                 .filter(auth_requests::user_uuid.eq(user_uuid))
                 .load::<Self>(conn)
                 .expect("Error loading auth_requests")
-        }}
+        })
+        .await
     }
 
     pub async fn find_by_user_and_requested_device(
@@ -144,7 +135,7 @@ impl AuthRequest {
         device_uuid: &DeviceId,
         conn: &DbConn,
     ) -> Option<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             auth_requests::table
                 .filter(auth_requests::user_uuid.eq(user_uuid))
                 .filter(auth_requests::request_device_identifier.eq(device_uuid))
@@ -152,24 +143,51 @@ impl AuthRequest {
                 .order_by(auth_requests::creation_date.desc())
                 .first::<Self>(conn)
                 .ok()
-        }}
+        })
+        .await
     }
 
     pub async fn find_created_before(dt: &NaiveDateTime, conn: &DbConn) -> Vec<Self> {
-        db_run! { conn: {
+        conn.run(move |conn| {
             auth_requests::table
                 .filter(auth_requests::creation_date.lt(dt))
                 .load::<Self>(conn)
                 .expect("Error loading auth_requests")
-        }}
+        })
+        .await
     }
 
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
-        db_run! { conn: {
+        conn.run(move |conn| {
             diesel::delete(auth_requests::table.filter(auth_requests::uuid.eq(&self.uuid)))
                 .execute(conn)
                 .map_res("Error deleting auth request")
-        }}
+        })
+        .await
+    }
+
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            diesel::delete(auth_requests::table.filter(auth_requests::user_uuid.eq(user_uuid)))
+                .execute(conn)
+                .map_res("Error deleting auth requests for user")
+        })
+        .await
+    }
+
+    /// Marks the request as used to log in. Returns false when it already was, so it only works once.
+    pub async fn set_authentication_date(uuid: &AuthRequestId, conn: &DbConn) -> ApiResult<bool> {
+        let now = Utc::now().naive_utc();
+        conn.run(move |conn| {
+            diesel::update(auth_requests::table)
+                .filter(auth_requests::uuid.eq(uuid))
+                .filter(auth_requests::authentication_date.is_null())
+                .set(auth_requests::authentication_date.eq(now))
+                .execute(conn)
+                .map(|updated| updated == 1)
+                .map_res("Error updating auth request")
+        })
+        .await
     }
 
     pub fn check_access_code(&self, access_code: &str) -> bool {
@@ -179,7 +197,7 @@ impl AuthRequest {
     pub async fn purge_expired_auth_requests(conn: &DbConn) {
         // delete auth requests older than 15 minutes which is functionally equivalent to upstream:
         // https://github.com/bitwarden/server/blob/f8ee2270409f7a13125cd414c450740af605a175/src/Sql/dbo/Auth/Stored%20Procedures/AuthRequest_DeleteIfExpired.sql
-        let expiry_time = Utc::now().naive_utc() - chrono::TimeDelta::try_minutes(15).unwrap();
+        let expiry_time = Utc::now().naive_utc() - chrono::TimeDelta::minutes(15);
         for auth_request in Self::find_created_before(&expiry_time, conn).await {
             auth_request.delete(conn).await.ok();
         }

@@ -1,18 +1,19 @@
 use std::net::IpAddr;
 
 use chrono::NaiveDateTime;
-use rocket::{form::FromForm, serde::json::Json, Route};
+use rocket::{Route, form::FromForm, serde::json::Json};
 use serde_json::Value;
 
 use crate::{
-    api::{EmptyResult, JsonResult},
+    CONFIG,
+    api::{ApiResult, EmptyResult, JsonResult},
     auth::{AdminHeaders, Headers},
     db::{
-        models::{Cipher, CipherId, Event, Membership, MembershipId, OrganizationId, UserId},
         DbConn, DbPool,
+        models::{Cipher, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId},
     },
+    error::MapResult,
     util::parse_date,
-    CONFIG,
 };
 
 /// ###############################################################################################################
@@ -29,6 +30,14 @@ struct EventRange {
     continuation_token: Option<String>,
 }
 
+impl EventRange {
+    fn date_range(&self) -> ApiResult<(NaiveDateTime, NaiveDateTime)> {
+        let start_date = parse_date(&self.start).map_res("Invalid start date")?;
+        let end_date = parse_date(self.continuation_token.as_ref().unwrap_or(&self.end)).map_res("Invalid end date")?;
+        Ok((start_date, end_date))
+    }
+}
+
 // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Controllers/EventsController.cs#L87
 #[get("/organizations/<org_id>/events?<data..>")]
 async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: AdminHeaders, conn: DbConn) -> JsonResult {
@@ -38,21 +47,16 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
 
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if !CONFIG.org_events_enabled() {
-        Vec::with_capacity(0)
-    } else {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
-        } else {
-            parse_date(&data.end)
-        };
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+        let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
             .await
             .iter()
-            .map(|e| e.to_json())
+            .map(Event::to_json)
             .collect()
+    } else {
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -64,27 +68,16 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
 
 #[get("/ciphers/<cipher_id>/events?<data..>")]
 async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Headers, conn: DbConn) -> JsonResult {
-    // Return an empty vec when we org events are disabled.
+    // Return an empty vec when org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if !CONFIG.org_events_enabled() {
-        Vec::with_capacity(0)
-    } else {
-        let mut events_json = Vec::with_capacity(0);
-        if Membership::user_has_ge_admin_access_to_cipher(&headers.user.uuid, &cipher_id, &conn).await {
-            let start_date = parse_date(&data.start);
-            let end_date = if let Some(before_date) = &data.continuation_token {
-                parse_date(before_date)
-            } else {
-                parse_date(&data.end)
-            };
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled()
+        && Membership::user_has_ge_admin_access_to_cipher(&headers.user.uuid, &cipher_id, &conn).await
+    {
+        let (start_date, end_date) = data.date_range()?;
 
-            events_json = Event::find_by_cipher_uuid(&cipher_id, &start_date, &end_date, &conn)
-                .await
-                .iter()
-                .map(|e| e.to_json())
-                .collect()
-        }
-        events_json
+        Event::find_by_cipher_uuid(&cipher_id, &start_date, &end_date, &conn).await.iter().map(Event::to_json).collect()
+    } else {
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -107,21 +100,16 @@ async fn get_user_events(
     }
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if !CONFIG.org_events_enabled() {
-        Vec::with_capacity(0)
-    } else {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
-        } else {
-            parse_date(&data.end)
-        };
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+        let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_org_and_member(&org_id, &member_id, &start_date, &end_date, &conn)
             .await
             .iter()
-            .map(|e| e.to_json())
+            .map(Event::to_json)
             .collect()
+    } else {
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -134,7 +122,8 @@ async fn get_user_events(
 fn get_continuation_token(events_json: &[Value]) -> Option<&str> {
     // When the length of the vec equals the max page_size there probably is more data
     // When it is less, then all events are loaded.
-    if events_json.len() as i64 == Event::PAGE_SIZE {
+    #[expect(clippy::cast_possible_truncation, reason = "PAGE_SIZE fits within usize")]
+    if events_json.len() == Event::PAGE_SIZE as usize {
         if let Some(last_event) = events_json.last() {
             last_event["date"].as_str()
         } else {
@@ -173,10 +162,11 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
     }
 
     for event in data.iter() {
-        let event_date = parse_date(&event.date);
+        let event_date = parse_date(&event.date).map_res("Invalid event date")?;
+        // Only the event types upstream accepts from clients, the rest are written server-side.
         match event.r#type {
-            1000..=1099 => {
-                _log_user_event(
+            t if t == EventType::UserClientExportedVault as i32 => {
+                log_user_event_impl(
                     event.r#type,
                     &headers.user.uuid,
                     headers.device.atype,
@@ -186,9 +176,12 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 )
                 .await;
             }
-            1600..=1699 => {
-                if let Some(org_id) = &event.organization_id {
-                    _log_event(
+            t if t == EventType::OrganizationClientExportedVault as i32 => {
+                // Only allow logging events for an organization the user is actually a member of.
+                if let Some(org_id) = &event.organization_id
+                    && Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, &conn).await.is_some()
+                {
+                    log_event_impl(
                         event.r#type,
                         org_id,
                         org_id,
@@ -201,38 +194,62 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                     .await;
                 }
             }
-            _ => {
-                if let Some(cipher_uuid) = &event.cipher_id {
-                    if let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await {
-                        if let Some(org_id) = cipher.organization_uuid {
-                            _log_event(
-                                event.r#type,
-                                cipher_uuid,
-                                &org_id,
-                                &headers.user.uuid,
-                                headers.device.atype,
-                                Some(event_date),
-                                &headers.ip.ip,
-                                &conn,
-                            )
-                            .await;
-                        }
-                    }
+            // Only the vault notification banner click is accepted from clients. The rest of
+            // the 1500..=1599 range is written server-side and must not be forgeable by a client.
+            t if t == EventType::OrganizationUserNotificationBannerActionClicked as i32 => {
+                if let Some(org_id) = &event.organization_id
+                    && let Some(membership) =
+                        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, &conn).await
+                {
+                    log_event_impl(
+                        event.r#type,
+                        &membership.uuid,
+                        org_id,
+                        &headers.user.uuid,
+                        headers.device.atype,
+                        Some(event_date),
+                        &headers.ip.ip,
+                        &conn,
+                    )
+                    .await;
                 }
             }
+            // Client-side cipher events (viewed, copied, toggled, autofilled, HTTP auth).
+            1107..=1114 | 1117 | 1119..=1133 => {
+                // The cipher determines the organization the event is logged to, so make sure the
+                // user can actually access it instead of trusting the provided cipher uuid.
+                if let Some(cipher_uuid) = &event.cipher_id
+                    && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
+                    && cipher.is_accessible_to_user(&headers.user.uuid, &conn).await
+                    && let Some(org_id) = cipher.organization_uuid
+                {
+                    log_event_impl(
+                        event.r#type,
+                        cipher_uuid,
+                        &org_id,
+                        &headers.user.uuid,
+                        headers.device.atype,
+                        Some(event_date),
+                        &headers.ip.ip,
+                        &conn,
+                    )
+                    .await;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
 }
 
-pub async fn log_user_event(event_type: i32, user_id: &UserId, device_type: i32, ip: &IpAddr, conn: &DbConn) {
+pub async fn log_user_event(event_type: EventType, user_id: &UserId, device_type: i32, ip: &IpAddr, conn: &DbConn) {
     if !CONFIG.org_events_enabled() {
         return;
     }
-    _log_user_event(event_type, user_id, device_type, None, ip, conn).await;
+    log_user_event_impl(event_type as i32, user_id, device_type, None, ip, conn).await;
 }
 
-async fn _log_user_event(
+async fn log_user_event_impl(
     event_type: i32,
     user_id: &UserId,
     device_type: i32,
@@ -267,7 +284,7 @@ async fn _log_user_event(
 }
 
 pub async fn log_event(
-    event_type: i32,
+    event_type: EventType,
     source_uuid: &str,
     org_id: &OrganizationId,
     act_user_id: &UserId,
@@ -278,11 +295,11 @@ pub async fn log_event(
     if !CONFIG.org_events_enabled() {
         return;
     }
-    _log_event(event_type, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
+    log_event_impl(event_type as i32, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn _log_event(
+#[expect(clippy::too_many_arguments)]
+async fn log_event_impl(
     event_type: i32,
     source_uuid: &str,
     org_id: &OrganizationId,
@@ -298,24 +315,24 @@ async fn _log_event(
         // 1000..=1099 Are user events, they need to be logged via log_user_event()
         // Cipher Events
         1100..=1199 => {
-            event.cipher_uuid = Some(source_uuid.to_string().into());
+            event.cipher_uuid = Some(source_uuid.to_owned().into());
         }
         // Collection Events
         1300..=1399 => {
-            event.collection_uuid = Some(source_uuid.to_string().into());
+            event.collection_uuid = Some(source_uuid.to_owned().into());
         }
         // Group Events
         1400..=1499 => {
-            event.group_uuid = Some(source_uuid.to_string().into());
+            event.group_uuid = Some(source_uuid.to_owned().into());
         }
         // Org User Events
         1500..=1599 => {
-            event.org_user_uuid = Some(source_uuid.to_string().into());
+            event.org_user_uuid = Some(source_uuid.to_owned().into());
         }
         // 1600..=1699 Are organizational events, and they do not need the source_uuid
         // Policy Events
         1700..=1799 => {
-            event.policy_uuid = Some(source_uuid.to_string().into());
+            event.policy_uuid = Some(source_uuid.to_owned().into());
         }
         // Ignore others
         _ => {}
@@ -330,14 +347,17 @@ async fn _log_event(
 
 pub async fn event_cleanup_job(pool: DbPool) {
     debug!("Start events cleanup job");
-    if CONFIG.events_days_retain().is_none() {
-        debug!("events_days_retain is not configured, abort");
+    if CONFIG.events_days_retain().is_none_or(|d| d == 0) {
+        debug!("events_days_retain is not configured or set to 0, skipping");
         return;
     }
 
-    if let Ok(conn) = pool.get().await {
-        Event::clean_events(&conn).await.ok();
-    } else {
-        error!("Failed to get DB connection while trying to cleanup the events table")
+    let Ok(conn) = pool.get().await else {
+        error!("Failed to get DB connection while trying to cleanup the events table");
+        return;
+    };
+
+    if let Err(e) = Event::clean_events(&conn).await {
+        error!("Failed to cleanup the events table: {e}");
     }
 }

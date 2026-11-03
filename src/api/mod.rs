@@ -25,18 +25,20 @@ pub use crate::api::{
     notifications::routes as notifications_routes,
     notifications::{AnonymousNotify, Notify, UpdateType, WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS},
     push::{
-        push_cipher_update, push_folder_update, push_logout, push_send_update, push_user_update, register_push_device,
-        unregister_push_device,
+        push_cipher_update, push_folder_update, push_logout, push_logout_to_relay, push_send_update, push_user_update,
+        register_push_device, unregister_push_device,
     },
     web::catchers as web_catchers,
     web::routes as web_routes,
-    web::static_files,
+    web::{STATIC_FILES, invalidate_css_cache},
 };
-use crate::db::{
-    models::{OrgPolicy, OrgPolicyType, User},
-    DbConn,
+use crate::{
+    CONFIG,
+    db::{
+        DbConn,
+        models::{OrgPolicy, OrgPolicyType, User},
+    },
 };
-use crate::CONFIG;
 
 // Type aliases for API methods results
 pub type ApiResult<T> = Result<T, crate::error::Error>;
@@ -44,7 +46,7 @@ pub type JsonResult = ApiResult<Json<Value>>;
 pub type EmptyResult = ApiResult<()>;
 
 // Common structs representing JSON data received
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PasswordOrOtpData {
     #[serde(alias = "MasterPasswordHash")]
@@ -74,6 +76,7 @@ impl PasswordOrOtpData {
     }
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "Bitwarden clients expect the data in this specific format")]
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterPasswordPolicy {
@@ -120,4 +123,22 @@ async fn master_password_policy(user: &User, conn: &DbConn) -> Value {
     // NOTE: Upstream still uses PascalCase here for `Object`!
     mpp_json["Object"] = json!("masterPasswordPolicy");
     mpp_json
+}
+
+// Identity responses use PascalCase keys like upstream, some clients (Android) only read those
+async fn identity_master_password_policy(user: &User, conn: &DbConn) -> Value {
+    match master_password_policy(user, conn).await {
+        Value::Object(policy) => Value::Object(
+            policy
+                .into_iter()
+                .map(|(mut key, value)| {
+                    if let Some(first) = key.get_mut(..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    (key, value)
+                })
+                .collect(),
+        ),
+        policy => policy,
+    }
 }

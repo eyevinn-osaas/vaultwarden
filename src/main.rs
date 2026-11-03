@@ -2,7 +2,7 @@
 // The recursion_limit is mainly triggered by the json!() macro.
 // The more key/value pairs there are the more recursion occurs.
 // We want to keep this as low as possible!
-#![recursion_limit = "165"]
+#![recursion_limit = "192"]
 
 // When enabled use MiMalloc as malloc instead of the default malloc
 #[cfg(feature = "enable_mimalloc")]
@@ -33,6 +33,7 @@ use std::{
     path::Path,
     process::exit,
     str::FromStr,
+    sync::{Arc, atomic::Ordering},
     thread,
 };
 
@@ -43,6 +44,8 @@ use tokio::{
 
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
+
+use rocket::data::{Limits, ToByteUnit};
 
 #[macro_use]
 mod error;
@@ -57,19 +60,19 @@ mod mail;
 mod ratelimit;
 mod sso;
 mod sso_client;
+mod storage;
 mod util;
 
-use crate::api::core::two_factor::duo_oidc::purge_duo_contexts;
-use crate::api::purge_auth_requests;
-use crate::api::{WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS};
-pub use config::{PathType, CONFIG};
+use crate::api::{
+    WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS, core::two_factor::duo_oidc::purge_duo_contexts, purge_auth_requests,
+};
+pub use config::{CONFIG, PathType};
 pub use error::{Error, MapResult};
-use rocket::data::{Limits, ToByteUnit};
-use std::sync::{atomic::Ordering, Arc};
 pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
+    install_rustls_crypto_provider();
     parse_args();
     launch_info();
 
@@ -134,27 +137,22 @@ fn parse_args() {
 
     if let Some(command) = pargs.subcommand().unwrap_or_default() {
         if command == "hash" {
-            use argon2::{
-                password_hash::SaltString, Algorithm::Argon2id, Argon2, ParamsBuilder, PasswordHasher, Version::V0x13,
-            };
+            use argon2::{Algorithm::Argon2id, Argon2, ParamsBuilder, PasswordHasher, Version::V0x13};
 
             let mut argon2_params = ParamsBuilder::new();
             let preset: Option<String> = pargs.opt_value_from_str(["-p", "--preset"]).unwrap_or_default();
             let selected_preset;
-            match preset.as_deref() {
-                Some("owasp") => {
-                    selected_preset = "owasp";
-                    argon2_params.m_cost(19456);
-                    argon2_params.t_cost(2);
-                    argon2_params.p_cost(1);
-                }
-                _ => {
-                    // Bitwarden preset is the default
-                    selected_preset = "bitwarden";
-                    argon2_params.m_cost(65540);
-                    argon2_params.t_cost(3);
-                    argon2_params.p_cost(4);
-                }
+            if preset.as_deref() == Some("owasp") {
+                selected_preset = "owasp";
+                argon2_params.m_cost(19456);
+                argon2_params.t_cost(2);
+                argon2_params.p_cost(1);
+            } else {
+                // Bitwarden preset is the default
+                selected_preset = "bitwarden";
+                argon2_params.m_cost(65540);
+                argon2_params.t_cost(3);
+                argon2_params.p_cost(4);
             }
 
             println!("Generate an Argon2id PHC string using the '{selected_preset}' preset:\n");
@@ -172,10 +170,10 @@ fn parse_args() {
             }
 
             let argon2 = Argon2::new(Argon2id, V0x13, argon2_params.build().unwrap());
-            let salt = SaltString::encode_b64(&crypto::get_random_bytes::<32>()).unwrap();
+            let salt = crypto::get_random_bytes::<32>();
 
             let argon2_timer = tokio::time::Instant::now();
-            if let Ok(password_hash) = argon2.hash_password(password.as_bytes(), &salt) {
+            if let Ok(password_hash) = argon2.hash_password_with_salt(password.as_bytes(), &salt) {
                 println!(
                     "\n\
                     ADMIN_TOKEN='{password_hash}'\n\n\
@@ -199,6 +197,14 @@ fn parse_args() {
             }
         }
         exit(0);
+    }
+}
+
+fn install_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("failed to install rustls ring crypto provider");
     }
 }
 
@@ -237,7 +243,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         let level = caps
             .get(1)
             .and_then(|m| log::LevelFilter::from_str(m.as_str()).ok())
-            .ok_or(Error::new("Failed to parse global log level".to_string(), ""))?;
+            .ok_or(Error::new("Failed to parse global log level".to_owned(), ""))?;
 
         let levels_override: Vec<(&str, log::LevelFilter)> = caps
             .get(2)
@@ -246,13 +252,13 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
                     .split(',')
                     .collect::<Vec<&str>>()
                     .into_iter()
-                    .flat_map(|s| match s.split_once('=') {
+                    .filter_map(|s| match s.split_once('=') {
                         Some((log, lvl_str)) => log::LevelFilter::from_str(lvl_str).ok().map(|lvl| (log, lvl)),
                         _ => None,
                     })
                     .collect()
             })
-            .ok_or(Error::new("Failed to parse overrides".to_string(), ""))?;
+            .ok_or(Error::new("Failed to parse overrides".to_owned(), ""))?;
 
         (level, levels_override)
     } else {
@@ -328,7 +334,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         ("vaultwarden::db::query_logger", log::LevelFilter::Off),
     ]);
 
-    for (path, level) in levels_override.into_iter() {
+    for (path, level) in levels_override {
         let _ = default_levels.insert(path, level);
     }
 
@@ -342,7 +348,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
     let mut logger = fern::Dispatch::new().level(level).chain(std::io::stdout());
 
     for (path, level) in default_levels {
-        logger = logger.level_for(path.to_string(), level);
+        logger = logger.level_for(path.to_owned(), level);
     }
 
     if CONFIG.extended_logging() {
@@ -353,7 +359,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
                 record.target(),
                 record.level(),
                 message
-            ))
+            ));
         });
     } else {
         logger = logger.format(|out, message, _| out.finish(format_args!("{message}")));
@@ -589,7 +595,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())
         .attach(util::Cors())
-        .attach(util::BetterLogging(extra_debug))
+        .attach(util::BetterLogging::new(extra_debug, basepath))
         .ignite()
         .await?;
 
@@ -599,9 +605,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     #[cfg(all(unix, sqlite))]
     {
-        if db::ACTIVE_DB_TYPE.get() != Some(&db::DbConnType::Sqlite) {
-            debug!("PostgreSQL and MySQL/MariaDB do not support this backup feature, skip adding USR1 signal.");
-        } else {
+        if db::ACTIVE_DB_TYPE.get() == Some(&db::DbConnType::Sqlite) {
             tokio::spawn(async move {
                 let mut signal_user1 = tokio::signal::unix::signal(SignalKind::user_defined1()).unwrap();
                 loop {
@@ -614,6 +618,8 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
                     }
                 }
             });
+        } else {
+            debug!("PostgreSQL and MySQL/MariaDB do not support this backup feature, skip adding USR1 signal.");
         }
     }
 
@@ -661,7 +667,7 @@ fn schedule_jobs(pool: db::DbPool) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     thread::Builder::new()
-        .name("job-scheduler".to_string())
+        .name("job-scheduler".to_owned())
         .spawn(move || {
             use job_scheduler_ng::{Job, JobScheduler};
             let _runtime_guard = runtime.enter();
@@ -714,7 +720,7 @@ fn schedule_jobs(pool: db::DbPool) {
             }
 
             // Clean unused, expired Duo authentication contexts.
-            if !CONFIG.duo_context_purge_schedule().is_empty() && CONFIG._enable_duo() && !CONFIG.duo_use_iframe() {
+            if !CONFIG.duo_context_purge_schedule().is_empty() && CONFIG._enable_duo() {
                 sched.add(Job::new(CONFIG.duo_context_purge_schedule().parse().unwrap(), || {
                     runtime.spawn(purge_duo_contexts(pool.clone()));
                 }));
@@ -723,7 +729,7 @@ fn schedule_jobs(pool: db::DbPool) {
             // Cleanup the event table of records x days old.
             if CONFIG.org_events_enabled()
                 && !CONFIG.event_cleanup_schedule().is_empty()
-                && CONFIG.events_days_retain().is_some()
+                && CONFIG.events_days_retain().is_some_and(|d| d != 0)
             {
                 sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
                     runtime.spawn(api::event_cleanup_job(pool.clone()));
@@ -748,7 +754,9 @@ fn schedule_jobs(pool: db::DbPool) {
             // tick, the one that was added earlier will run first.
             loop {
                 sched.tick();
-                runtime.block_on(tokio::time::sleep(tokio::time::Duration::from_millis(CONFIG.job_poll_interval_ms())));
+                runtime.block_on(tokio::time::sleep(tokio::time::Duration::from_millis(u64::from(
+                    CONFIG.job_poll_interval_ms(),
+                ))));
             }
         })
         .expect("Error spawning job scheduler thread");

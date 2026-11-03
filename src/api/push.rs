@@ -4,21 +4,21 @@ use std::{
 };
 
 use reqwest::{
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Method,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::{
+    CONFIG,
     api::{ApiResult, EmptyResult, UpdateType},
     db::{
-        models::{AuthRequestId, Cipher, Device, Folder, PushId, Send, User, UserId},
         DbConn,
+        models::{AuthRequestId, Cipher, Device, Folder, PushId, Send, User, UserId},
     },
     http_client::make_http_request,
     util::{format_date, get_uuid},
-    CONFIG,
 };
 
 #[derive(Deserialize)]
@@ -74,9 +74,9 @@ async fn get_auth_api_token() -> ApiResult<String> {
     };
 
     let mut api_token = API_TOKEN.write().await;
-    api_token.valid_until = Instant::now()
-        .checked_add(Duration::new((json_pushtoken.expires_in / 2) as u64, 0)) // Token valid for half the specified time
-        .unwrap();
+    // Token valid for half the specified time
+    let half_expires_in = u64::from((json_pushtoken.expires_in / 2).max(0).cast_unsigned());
+    api_token.valid_until = Instant::now().checked_add(Duration::from_secs(half_expires_in)).unwrap();
 
     api_token.access_token = json_pushtoken.access_token;
 
@@ -139,21 +139,25 @@ pub async fn unregister_push_device(push_id: Option<&PushId>) -> EmptyResult {
     if !CONFIG.push_enabled() || push_id.is_none() {
         return Ok(());
     }
-    let auth_api_token = get_auth_api_token().await?;
+    let data = json!({
+        "id": push_id.as_ref().unwrap(),
+    });
 
+    let auth_api_token = get_auth_api_token().await?;
     let auth_header = format!("Bearer {auth_api_token}");
 
-    match make_http_request(
-        Method::POST,
-        &format!("{}/push/delete/{}", CONFIG.push_relay_uri(), push_id.as_ref().unwrap()),
-    )?
-    .header(AUTHORIZATION, auth_header)
-    .send()
-    .await
+    if let Err(e) = make_http_request(Method::POST, &(CONFIG.push_relay_uri() + "/push/delete"))?
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json")
+        .header(AUTHORIZATION, auth_header)
+        .json(&data)
+        .send()
+        .await?
+        .error_for_status()
     {
-        Ok(r) => r,
-        Err(e) => err!(format!("An error occurred during device unregistration: {e}")),
-    };
+        err!(format!("An error occurred during device unregistration: {e}"));
+    }
+
     Ok(())
 }
 
@@ -161,7 +165,7 @@ pub async fn push_cipher_update(ut: UpdateType, cipher: &Cipher, device: &Device
     // We shouldn't send a push notification on cipher update if the cipher belongs to an organization, this isn't implemented in the upstream server too.
     if cipher.organization_uuid.is_some() {
         return;
-    };
+    }
     let Some(user_id) = &cipher.user_uuid else {
         debug!("Cipher has no uuid");
         return;
@@ -190,20 +194,26 @@ pub async fn push_cipher_update(ut: UpdateType, cipher: &Cipher, device: &Device
 
 pub async fn push_logout(user: &User, acting_device: Option<&Device>, conn: &DbConn) {
     if Device::check_user_has_push_device(&user.uuid, conn).await {
-        tokio::task::spawn(send_to_push_relay(json!({
-            "userId": user.uuid,
-            "organizationId": (),
-            "deviceId": acting_device.and_then(|d| d.push_uuid.as_ref()),
-            "identifier": acting_device.map(|d| &d.uuid),
-            "type": UpdateType::LogOut as i32,
-            "payload": {
-                "userId": user.uuid,
-                "date": format_date(&user.updated_at)
-            },
-            "clientType": null,
-            "installationId": null
-        })));
+        push_logout_to_relay(user, acting_device);
     }
+}
+
+// Sends the logout without checking for push devices first.
+// Needed after deleting a user, when the devices are already gone from the database.
+pub fn push_logout_to_relay(user: &User, acting_device: Option<&Device>) {
+    tokio::task::spawn(send_to_push_relay(json!({
+        "userId": user.uuid,
+        "organizationId": (),
+        "deviceId": acting_device.and_then(|d| d.push_uuid.as_ref()),
+        "identifier": acting_device.map(|d| &d.uuid),
+        "type": UpdateType::LogOut as i32,
+        "payload": {
+            "userId": user.uuid,
+            "date": format_date(&user.updated_at)
+        },
+        "clientType": null,
+        "installationId": null
+    })));
 }
 
 pub async fn push_user_update(ut: UpdateType, user: &User, push_uuid: Option<&PushId>, conn: &DbConn) {
@@ -244,23 +254,23 @@ pub async fn push_folder_update(ut: UpdateType, folder: &Folder, device: &Device
 }
 
 pub async fn push_send_update(ut: UpdateType, send: &Send, device: &Device, conn: &DbConn) {
-    if let Some(s) = &send.user_uuid {
-        if Device::check_user_has_push_device(s, conn).await {
-            tokio::task::spawn(send_to_push_relay(json!({
+    if let Some(s) = &send.user_uuid
+        && Device::check_user_has_push_device(s, conn).await
+    {
+        tokio::task::spawn(send_to_push_relay(json!({
+            "userId": send.user_uuid,
+            "organizationId": null,
+            "deviceId": device.push_uuid, // Should be the records unique uuid of the acting device (unique uuid per user/device)
+            "identifier": device.uuid, // Should be the acting device id (aka uuid per device/app)
+            "type": ut as i32,
+            "payload": {
+                "id": send.uuid,
                 "userId": send.user_uuid,
-                "organizationId": null,
-                "deviceId": device.push_uuid, // Should be the records unique uuid of the acting device (unique uuid per user/device)
-                "identifier": device.uuid, // Should be the acting device id (aka uuid per device/app)
-                "type": ut as i32,
-                "payload": {
-                    "id": send.uuid,
-                    "userId": send.user_uuid,
-                    "revisionDate": format_date(&send.revision_date)
-                },
-                "clientType": null,
-                "installationId": null
-            })));
-        }
+                "revisionDate": format_date(&send.revision_date)
+            },
+            "clientType": null,
+            "installationId": null
+        })));
     }
 }
 
@@ -296,7 +306,7 @@ async fn send_to_push_relay(notification_data: Value) {
         .await
     {
         error!("An error occurred while sending a send update to the push relay: {e}");
-    };
+    }
 }
 
 pub async fn push_auth_request(user_id: &UserId, auth_request_id: &str, device: &Device, conn: &DbConn) {

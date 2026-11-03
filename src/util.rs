@@ -1,24 +1,28 @@
 //
 // Web Headers and caching
 //
-use std::{collections::HashMap, io::Cursor, path::Path};
+use std::{collections::HashMap, env, fmt, io::Cursor, path::Path, str::FromStr};
 
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use num_traits::ToPrimitive;
+use tokio::{
+    runtime::Handle,
+    time::{Duration, sleep},
+};
+
+use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
+
 use rocket::{
+    Data, Orbit, Request, Response, Rocket,
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Header, HeaderMap, Method, Status},
     response::{self, Responder},
-    Data, Orbit, Request, Response, Rocket,
-};
-
-use tokio::{
-    runtime::Handle,
-    time::{sleep, Duration},
 };
 
 use crate::{
-    config::{PathType, SUPPORTED_FEATURE_FLAGS},
     CONFIG,
+    config::{PathType, SUPPORTED_FEATURE_FLAGS},
 };
 
 pub struct AppHeaders();
@@ -75,11 +79,16 @@ impl Fairing for AppHeaders {
         // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
         // This is the same behavior as upstream Bitwarden.
-        if !req_uri_path.ends_with("connector.html") {
+        if req_uri_path.ends_with("connector.html") {
+            // It looks like this header get's set somewhere else also, make sure this is not sent for these files, it will cause MFA issues.
+            res.remove_header("X-Frame-Options");
+        } else {
             let csp = if is_image {
                 // Prevent scripts, frames, objects, etc., from loading with images, mainly for SVG images, since these could contain JavaScript and other unsafe items.
                 // Even though we sanitize SVG images before storing and viewing them, it's better to prevent allowing these elements.
-                String::from("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'none'; frame-src 'none'; object-src 'none")
+                String::from(
+                    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'none'; frame-src 'none'; object-src 'none",
+                )
             } else {
                 // # Frame Ancestors:
                 // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
@@ -129,9 +138,6 @@ impl Fairing for AppHeaders {
 
             res.set_raw_header("Content-Security-Policy", csp);
             res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
-        } else {
-            // It looks like this header get's set somewhere else also, make sure this is not sent for these files, it will cause MFA issues.
-            res.remove_header("X-Frame-Options");
         }
 
         // Disable cache unless otherwise specified
@@ -146,7 +152,7 @@ pub struct Cors();
 impl Cors {
     fn get_header(headers: &HeaderMap<'_>, name: &str) -> String {
         match headers.get_one(name) {
-            Some(h) => h.to_string(),
+            Some(h) => h.to_owned(),
             _ => String::new(),
         }
     }
@@ -204,7 +210,7 @@ impl Fairing for Cors {
 pub struct Cached<R> {
     response: R,
     is_immutable: bool,
-    ttl: u64,
+    ttl: u32,
 }
 
 impl<R> Cached<R> {
@@ -212,7 +218,7 @@ impl<R> Cached<R> {
         Self {
             response,
             is_immutable,
-            ttl: 604800, // 7 days
+            ttl: 604_800, // 7 days
         }
     }
 
@@ -224,7 +230,7 @@ impl<R> Cached<R> {
         }
     }
 
-    pub fn ttl(response: R, ttl: u64, is_immutable: bool) -> Cached<R> {
+    pub fn ttl(response: R, ttl: u32, is_immutable: bool) -> Cached<R> {
         Self {
             response,
             is_immutable,
@@ -245,8 +251,49 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
         res.set_raw_header("Cache-Control", cache_control_header);
 
         let time_now = Local::now();
-        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.try_into().unwrap()).unwrap();
+        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.into()).unwrap();
         res.set_raw_header("Expires", format_datetime_http(&expiry_time));
+        Ok(res)
+    }
+}
+
+pub struct EtagCached<R> {
+    response: R,
+    content_type: ContentType,
+    etag: String,
+}
+
+impl<R> EtagCached<R> {
+    /// An `etag` response should always be quoted
+    pub fn new(response: R, content_type: ContentType, etag: &str) -> Self {
+        Self {
+            response,
+            content_type,
+            etag: format!("\"{etag}\""),
+        }
+    }
+}
+
+impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for EtagCached<R> {
+    fn respond_to(self, request: &'r Request<'_>) -> response::Result<'static> {
+        // Check and validate a `If-None-Match` ETag header
+        // Multiple tags could be returned for the same URI if the browser has multiple versions cached
+        // Also, weak tags are prefixed with `W/`, but ETags are always weak, so just strip it too before comparing
+        let etag_matches = request
+            .headers()
+            .get_one("If-None-Match")
+            .is_some_and(|v| v.split(',').any(|t| t.trim().trim_start_matches("W/") == self.etag));
+
+        let mut res = if etag_matches {
+            Response::build().status(Status::NotModified).ok()?
+        } else {
+            self.response.respond_to(request)?
+        };
+
+        // Both 200 (OK) and 304 (Not Modified) need to return the Content-Type Etag and Cache-Control
+        res.set_header(self.content_type);
+        res.set_raw_header("Etag", self.etag);
+        res.set_raw_header("Cache-Control", "public, no-cache");
         Ok(res)
     }
 }
@@ -255,19 +302,69 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
 // Effectively ignores, any static file route, and the alive endpoint
 const LOGGED_ROUTES: [&str; 7] = ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications"];
 
-// Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
-pub struct BetterLogging(pub bool);
+const MAX_LOGGED_QUERY_BYTES: usize = 100;
+
+// Query values can hold secrets, like the access code of a login request, so we don't log them
+fn redact_query_values(query: &str) -> String {
+    query
+        .split('&')
+        .map(|param| match param.split_once('=') {
+            Some((name, _)) => format!("{name}=…"),
+            None => param.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+// When extra is true, we ignore the whitelist above and also print the mounts
+pub struct BetterLogging {
+    extra: bool,
+    log_requests: bool,
+    log_response: bool,
+    domain_path: String,
+}
+
+impl BetterLogging {
+    pub fn new(extra: bool, domain_path: &str) -> Self {
+        Self {
+            extra,
+            log_requests: log_enabled!(target: "request", log::Level::Info),
+            log_response: log_enabled!(target: "response", log::Level::Info),
+            domain_path: rocket::http::RawStr::new(&domain_path).percent_decode_lossy().into_owned(),
+        }
+    }
+
+    fn log_path<'p>(&self, method: Method, path: &'p rocket::http::RawStr) -> Option<std::borrow::Cow<'p, str>> {
+        if !self.extra && method == Method::Options {
+            return None;
+        }
+        let path = path.percent_decode_lossy();
+        if self.extra {
+            return Some(path);
+        }
+        let subpath = path.strip_prefix(&self.domain_path).unwrap_or(&path);
+        LOGGED_ROUTES.iter().any(|r| subpath.starts_with(r)).then_some(path)
+    }
+}
+
 #[rocket::async_trait]
 impl Fairing for BetterLogging {
     fn info(&self) -> Info {
+        let mut kind = Kind::Liftoff;
+        if self.log_requests {
+            kind = kind | Kind::Request;
+        }
+        if self.log_response {
+            kind = kind | Kind::Response;
+        }
         Info {
             name: "Better Logging",
-            kind: Kind::Liftoff | Kind::Request | Kind::Response,
+            kind,
         }
     }
 
     async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
-        if self.0 {
+        if self.extra {
             info!(target: "routes", "Routes loaded:");
             let mut routes: Vec<_> = rocket.routes().collect();
             routes.sort_by_key(|r| r.uri.path());
@@ -286,41 +383,34 @@ impl Fairing for BetterLogging {
         } else {
             "http"
         };
-        let addr = format!("{scheme}://{}:{}", &config.address, &config.port);
+        let addr = format!("{scheme}://{}:{}", config.address, config.port);
         info!(target: "start", "Rocket has launched from {addr}");
     }
 
     async fn on_request(&self, request: &mut Request<'_>, _data: &mut Data<'_>) {
-        let method = request.method();
-        if !self.0 && method == Method::Options {
-            return;
-        }
         let uri = request.uri();
-        let uri_path = uri.path();
-        let uri_path_str = uri_path.url_decode_lossy();
-        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
-            match uri.query() {
-                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
-                None => info!(target: "request", "{method} {uri_path_str}"),
-            };
+        let method = request.method();
+        let Some(path) = self.log_path(method, uri.path().raw()) else {
+            return;
+        };
+        match uri.query() {
+            Some(q) => {
+                let query = redact_query_values(q.as_str());
+                let query = &query[..query.floor_char_boundary(MAX_LOGGED_QUERY_BYTES)];
+                info!(target: "request", "{method} {}?{}", path.escape_debug(), query.escape_debug());
+            }
+            None => info!(target: "request", "{method} {}", path.escape_debug()),
         }
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
-        if !self.0 && request.method() == Method::Options {
+        if self.log_path(request.method(), request.uri().path().raw()).is_none() {
             return;
         }
-        let uri_path = request.uri().path();
-        let uri_path_str = uri_path.url_decode_lossy();
-        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
-            let status = response.status();
-            if let Some(ref route) = request.route() {
-                info!(target: "response", "{route} => {status}")
-            } else {
-                info!(target: "response", "{status}")
-            }
+        let status = response.status();
+        match request.route() {
+            Some(r) => info!(target: "response", "{r} => {status}"),
+            None => info!(target: "response", "{status}"),
         }
     }
 }
@@ -336,7 +426,7 @@ pub fn get_display_size(size: i64) -> String {
     let mut unit_counter = 0;
 
     loop {
-        if size > 1024. {
+        if size > 1024. && unit_counter < UNITS.len() - 1 {
             size /= 1024.;
             unit_counter += 1;
         } else {
@@ -354,9 +444,6 @@ pub fn get_uuid() -> String {
 //
 // String util methods
 //
-
-use std::str::FromStr;
-
 #[inline]
 pub fn upcase_first(s: &str) -> String {
     let mut c = s.chars();
@@ -390,9 +477,6 @@ where
 //
 // Env methods
 //
-
-use std::env;
-
 pub fn get_env_str_value(key: &str) -> Option<String> {
     let key_file = format!("{key}_FILE");
     let value_from_env = env::var(key);
@@ -402,27 +486,41 @@ pub fn get_env_str_value(key: &str) -> Option<String> {
         (Ok(_), Ok(_)) => panic!("You should not define both {key} and {key_file}!"),
         (Ok(v_env), Err(_)) => Some(v_env),
         (Err(_), Ok(v_file)) => match std::fs::read_to_string(v_file) {
-            Ok(content) => Some(content.trim().to_string()),
+            Ok(content) => Some(content.trim().to_owned()),
             Err(e) => panic!("Failed to load {key}: {e:?}"),
         },
         _ => None,
     }
 }
 
-pub fn get_env<V>(key: &str) -> Option<V>
+pub static INVALID_ENV_VARS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+pub fn get_env<V>(key: &'static str) -> Option<V>
 where
     V: FromStr,
 {
-    try_parse_string(get_env_str_value(key))
+    let value = get_env_str_value(key);
+    let value_is_some = value.is_some();
+    let parsed: Option<V> = try_parse_string(value);
+    if parsed.is_none() && value_is_some {
+        println!("[ERROR] `{key}` contains an invalid value for its type and is ignored, the default is used instead.");
+        INVALID_ENV_VARS.lock().unwrap().push(key);
+    }
+    parsed
 }
 
-pub fn get_env_bool(key: &str) -> Option<bool> {
+pub fn get_env_bool(key: &'static str) -> Option<bool> {
     const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
     const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
 
     match get_env_str_value(key) {
         Some(val) if TRUE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(true),
         Some(val) if FALSE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(false),
+        Some(_) => {
+            println!("[ERROR] `{key}` contains an invalid boolean value and is ignored, the default is used instead.");
+            INVALID_ENV_VARS.lock().unwrap().push(key);
+            None
+        }
         _ => None,
     }
 }
@@ -430,8 +528,6 @@ pub fn get_env_bool(key: &str) -> Option<bool> {
 //
 // Date util methods
 //
-
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 
 /// Formats a UTC-offset `NaiveDateTime` in the format used by Bitwarden API
 /// responses with "date" fields (`CreationDate`, `RevisionDate`, etc.).
@@ -457,10 +553,10 @@ pub fn validate_and_format_date(dt: &str) -> String {
 pub fn format_datetime_local(dt: &DateTime<Local>, fmt: &str) -> String {
     // Try parsing the `TZ` environment variable to enable formatting `%Z` as
     // a time zone abbreviation.
-    if let Ok(tz) = env::var("TZ") {
-        if let Ok(tz) = tz.parse::<chrono_tz::Tz>() {
-            return dt.with_timezone(&tz).format(fmt).to_string();
-        }
+    if let Ok(tz) = env::var("TZ")
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        return dt.with_timezone(&tz).format(fmt).to_string();
     }
 
     // Otherwise, fall back to formatting `%Z` as a UTC offset.
@@ -486,8 +582,8 @@ pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
     expiry_time.to_rfc2822().replace("+0000", "GMT")
 }
 
-pub fn parse_date(date: &str) -> NaiveDateTime {
-    DateTime::parse_from_rfc3339(date).unwrap().naive_utc()
+pub fn parse_date(date: &str) -> Option<NaiveDateTime> {
+    DateTime::parse_from_rfc3339(date).ok().map(|dt| dt.naive_utc())
 }
 
 /// Returns true or false if an email address is valid or not
@@ -501,10 +597,7 @@ pub fn is_valid_email(email: &str) -> bool {
     let Ok(email_url) = url::Url::parse(&format!("https://{}", email.domain())) else {
         return false;
     };
-    if email_url.path().ne("/") || email_url.domain().is_none() || email_url.query().is_some() {
-        return false;
-    }
-    true
+    email_url.domain().is_some() && email_url.path() == "/" && email_url.query().is_none()
 }
 
 //
@@ -512,6 +605,7 @@ pub fn is_valid_email(email: &str) -> bool {
 //
 
 /// Returns true if the program is running in Docker, Podman or Kubernetes.
+#[must_use]
 pub fn is_running_in_container() -> bool {
     Path::new("/.dockerenv").exists()
         || Path::new("/run/.containerenv").exists()
@@ -543,10 +637,10 @@ pub fn get_active_web_release() -> String {
     ];
 
     for version_file in version_files {
-        if let Ok(version_str) = std::fs::read_to_string(&version_file) {
-            if let Ok(version) = serde_json::from_str::<WebVaultVersion>(&version_str) {
-                return String::from(version.version.trim_start_matches('v'));
-            }
+        if let Ok(version_str) = std::fs::read_to_string(&version_file)
+            && let Ok(version) = serde_json::from_str::<WebVaultVersion>(&version_str)
+        {
+            return String::from(version.version.trim_start_matches('v'));
         }
     }
 
@@ -556,12 +650,6 @@ pub fn get_active_web_release() -> String {
 //
 // Deserialization methods
 //
-
-use std::fmt;
-
-use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::Value;
-
 pub type JsonMap = serde_json::Map<String, Value>;
 
 #[derive(Serialize, Deserialize)]
@@ -605,7 +693,7 @@ impl<'de> Visitor<'de> for LowerCaseVisitor {
         let mut result_map = JsonMap::new();
 
         while let Some((key, value)) = map.next_entry()? {
-            result_map.insert(_process_key(key), convert_json_key_lcase_first(value));
+            result_map.insert(process_json_key(key), convert_json_key_lcase_first(value));
         }
 
         Ok(Value::Object(result_map))
@@ -627,7 +715,7 @@ impl<'de> Visitor<'de> for LowerCaseVisitor {
 
 // Inner function to handle a special case for the 'ssn' key.
 // This key is part of the Identity Cipher (Social Security Number)
-fn _process_key(key: &str) -> String {
+fn process_json_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "ssn".into(),
         _ => lcase_first(key),
@@ -664,21 +752,24 @@ impl NumberOrString {
         }
     }
 
-    #[allow(clippy::wrong_self_convention)]
+    #[expect(clippy::wrong_self_convention)]
     pub fn into_i32(&self) -> Result<i32, crate::Error> {
         use std::num::ParseIntError as PIE;
         match self {
-            NumberOrString::Number(n) => match n.to_i32() {
-                Some(n) => Ok(n),
-                None => err!("Number does not fit in i32"),
-            },
+            NumberOrString::Number(n) => {
+                if let Some(n) = n.to_i32() {
+                    Ok(n)
+                } else {
+                    err!("Number does not fit in i32")
+                }
+            }
             NumberOrString::String(s) => {
                 s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
             }
         }
     }
 
-    #[allow(clippy::wrong_self_convention)]
+    #[expect(clippy::wrong_self_convention)]
     pub fn into_i64(&self) -> Result<i64, crate::Error> {
         use std::num::ParseIntError as PIE;
         match self {
@@ -753,11 +844,11 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
 
         Value::Object(obj) => {
             let mut json_map = JsonMap::new();
-            for (key, value) in obj.into_iter() {
+            for (key, value) in obj {
                 match (key, value) {
                     (key, Value::Object(elm)) => {
                         let inner_value = convert_json_key_lcase_first(Value::Object(elm));
-                        json_map.insert(_process_key(&key), inner_value);
+                        json_map.insert(process_json_key(&key), inner_value);
                     }
 
                     (key, Value::Array(elm)) => {
@@ -767,11 +858,11 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
                             inner_array.push(convert_json_key_lcase_first(inner_obj));
                         }
 
-                        json_map.insert(_process_key(&key), Value::Array(inner_array));
+                        json_map.insert(process_json_key(&key), Value::Array(inner_array));
                     }
 
                     (key, value) => {
-                        json_map.insert(_process_key(&key), value);
+                        json_map.insert(process_json_key(&key), value);
                     }
                 }
             }
@@ -793,7 +884,7 @@ pub enum FeatureFlagFilter {
 /// Parses the experimental client feature flags string into a HashMap.
 pub fn parse_experimental_client_feature_flags(
     experimental_client_feature_flags: &str,
-    filter_mode: FeatureFlagFilter,
+    filter_mode: &FeatureFlagFilter,
 ) -> HashMap<String, bool> {
     experimental_client_feature_flags
         .split(',')
@@ -811,7 +902,8 @@ pub fn parse_experimental_client_feature_flags(
 /// TODO: This is extracted from IpAddr::is_global, which is unstable:
 /// https://doc.rust-lang.org/nightly/std/net/enum.IpAddr.html#method.is_global
 /// Remove once https://github.com/rust-lang/rust/issues/27709 is merged
-#[allow(clippy::nonminimal_bool)]
+// #[expect(clippy::nonminimal_bool, reason = "Mostly copy/paste from std, keep as-is")]
+#[expect(clippy::decimal_bitwise_operands, reason = "Mostly copy/paste from std, keep as-is")]
 #[cfg(any(not(feature = "unstable"), test))]
 pub fn is_global_hardcoded(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -911,15 +1003,15 @@ mod tests {
     use std::net::IpAddr;
 
     #[test]
-    #[ignore]
+    #[ignore = "exhaustive IPv4 check is too slow for the regular test suite"]
     fn test_ipv4_global() {
         for a in 0..u8::MAX {
-            println!("Iter: {}/255", a);
+            println!("Iter: {a}/255");
             for b in 0..u8::MAX {
                 for c in 0..u8::MAX {
                     for d in 0..u8::MAX {
                         let ip = IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
-                        assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {}", ip)
+                        assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {ip}");
                     }
                 }
             }
@@ -927,15 +1019,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "random IPv6 check is too slow for the regular test suite"]
     fn test_ipv6_global() {
-        use rand::Rng;
+        use rand::RngExt;
 
         std::thread::scope(|s| {
             for t in 0..16 {
-                let handle = s.spawn(move || {
+                let _handle = s.spawn(move || {
                     let mut v = [0u8; 16];
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
 
                     for i in 0..20 {
                         println!("Thread {t} Iter: {i}/50");
@@ -948,5 +1040,30 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod query_log_tests {
+    use super::{MAX_LOGGED_QUERY_BYTES, redact_query_values};
+
+    #[test]
+    fn test_redact_query_values() {
+        assert_eq!(redact_query_values("code=SECRET"), "code=…");
+        assert_eq!(redact_query_values("code=SECRET&other=SECRET"), "code=…&other=…");
+        assert_eq!(redact_query_values("a=1&b=2&flag"), "a=…&b=…&flag");
+        assert_eq!(redact_query_values("a=b=SECRET"), "a=…");
+        assert_eq!(redact_query_values("a=1&&=SECRET"), "a=…&&=…");
+        assert_eq!(redact_query_values("a=x%26b%3DSECRET"), "a=…");
+        assert_eq!(redact_query_values("a=1;b=SECRET"), "a=…");
+        assert_eq!(redact_query_values("a=1&a=SECRET"), "a=…&a=…");
+        assert_eq!(redact_query_values(""), "");
+    }
+
+    #[test]
+    fn test_redacted_query_truncates_on_a_char_boundary() {
+        let name = "a".repeat(MAX_LOGGED_QUERY_BYTES - 1);
+        let query = redact_query_values(&format!("{name}=SECRET"));
+        assert_eq!(&query[..query.floor_char_boundary(MAX_LOGGED_QUERY_BYTES)], format!("{name}="));
     }
 }

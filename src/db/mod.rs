@@ -6,25 +6,23 @@ use std::{
 };
 
 use diesel::{
+    Connection, RunQueryDsl,
     connection::SimpleConnection,
     r2d2::{CustomizeConnection, Pool, PooledConnection},
-    Connection, RunQueryDsl,
 };
-
 use rocket::{
+    Request,
     http::Status,
     request::{FromRequest, Outcome},
-    Request,
 };
-
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 
 use crate::{
-    error::{Error, MapResult},
     CONFIG,
+    error::{Error, MapResult},
 };
 
 // These changes are based on Rocket 0.5-rc wrapper of Diesel: https://github.com/SergioBenitez/Rocket/blob/v0.5-rc/contrib/sync_db_pools
@@ -62,7 +60,7 @@ pub struct DbConnManager {
 impl DbConnManager {
     pub fn new(database_url: &str) -> Self {
         Self {
-            database_url: database_url.to_string(),
+            database_url: database_url.to_owned(),
         }
     }
 
@@ -214,8 +212,8 @@ impl DbPool {
         let pool = Pool::builder()
             .max_size(max_conns)
             .min_idle(Some(CONFIG.database_min_conns()))
-            .idle_timeout(Some(Duration::from_secs(CONFIG.database_idle_timeout())))
-            .connection_timeout(Duration::from_secs(CONFIG.database_timeout()))
+            .idle_timeout(Some(Duration::from_secs(u64::from(CONFIG.database_idle_timeout()))))
+            .connection_timeout(Duration::from_secs(u64::from(CONFIG.database_timeout())))
             .connection_customizer(Box::new(DbConnOptions {
                 init_stmts: conn_type.get_init_stmts(),
             }))
@@ -224,7 +222,7 @@ impl DbPool {
 
         // Set a global to determine the database more easily throughout the rest of the code
         if ACTIVE_DB_TYPE.set(conn_type).is_err() {
-            error!("Tried to set the active database connection type more than once.")
+            error!("Tried to set the active database connection type more than once.");
         }
 
         Ok(DbPool {
@@ -235,7 +233,7 @@ impl DbPool {
 
     // Get a connection from the pool
     pub async fn get(&self) -> Result<DbConn, Error> {
-        let duration = Duration::from_secs(CONFIG.database_timeout());
+        let duration = Duration::from_secs(u64::from(CONFIG.database_timeout()));
         let permit = match timeout(duration, Arc::clone(&self.semaphore).acquire_owned()).await {
             Ok(p) => p.expect("Semaphore should be open"),
             Err(_) => {
@@ -272,22 +270,40 @@ impl DbConnType {
             #[cfg(not(postgresql))]
             err!("`DATABASE_URL` is a PostgreSQL URL, but the 'postgresql' feature is not enabled")
 
-        //Sqlite
-        } else {
+        // Sqlite (explicit)
+        } else if url.len() > 7 && &url[..7] == "sqlite:" {
             #[cfg(sqlite)]
             return Ok(DbConnType::Sqlite);
 
             #[cfg(not(sqlite))]
-            err!("`DATABASE_URL` looks like a SQLite URL, but 'sqlite' feature is not enabled")
+            err!("`DATABASE_URL` is a SQLite URL, but the 'sqlite' feature is not enabled")
         }
+
+        // No recognized scheme — assume legacy bare-path SQLite, but the database file must already exist.
+        // This prevents misconfigured URLs (typos, quoted strings) from silently creating a new empty SQLite database.
+        #[cfg(sqlite)]
+        {
+            if std::path::Path::new(url).exists() {
+                return Ok(DbConnType::Sqlite);
+            }
+            err!(format!(
+                "`DATABASE_URL` does not match any known database scheme (mysql://, postgresql://, sqlite://) \
+                    and no existing SQLite database was found at '{url}'. \
+                    If you intend to use SQLite, use an explicit `sqlite://` scheme in your `DATABASE_URL`. \
+                    Otherwise, check your DATABASE_URL for typos or quoting issues."
+            ))
+        }
+
+        #[cfg(not(sqlite))]
+        err!("`DATABASE_URL` does not match any known database scheme (mysql://, postgresql://, sqlite://)")
     }
 
     pub fn get_init_stmts(&self) -> String {
         let init_stmts = CONFIG.database_conn_init();
-        if !init_stmts.is_empty() {
-            init_stmts
-        } else {
+        if init_stmts.is_empty() {
             self.default_init_stmts()
+        } else {
+            init_stmts
         }
     }
 
@@ -298,7 +314,7 @@ impl DbConnType {
             #[cfg(postgresql)]
             Self::Postgresql => String::new(),
             #[cfg(sqlite)]
-            Self::Sqlite => "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;".to_string(),
+            Self::Sqlite => "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;".to_owned(),
         }
     }
 }
@@ -389,12 +405,13 @@ pub fn backup_sqlite() -> Result<String, Error> {
     use diesel::Connection;
 
     let db_url = CONFIG.database_url();
-    if DbConnType::from_url(&CONFIG.database_url()).map(|t| t == DbConnType::Sqlite).unwrap_or(false) {
-        // Since we do not allow any schema for sqlite database_url's like `file:` or `sqlite:` to be set, we can assume here it isn't
-        // This way we can set a readonly flag on the opening mode without issues.
-        let mut conn = diesel::sqlite::SqliteConnection::establish(&format!("sqlite://{db_url}?mode=ro"))?;
+    if DbConnType::from_url(&CONFIG.database_url()).is_ok_and(|t| t == DbConnType::Sqlite) {
+        // Strip the sqlite:// prefix if present to get the raw file path
+        let file_path = db_url.strip_prefix("sqlite://").unwrap_or(&db_url);
+        // Open a read-only connection for the backup
+        let mut conn = diesel::sqlite::SqliteConnection::establish(&format!("sqlite://{file_path}?mode=ro"))?;
 
-        let db_path = std::path::Path::new(&db_url).parent().unwrap();
+        let db_path = std::path::Path::new(file_path).parent().unwrap();
         let backup_file = db_path
             .join(format!("db_{}.sqlite3", chrono::Utc::now().format("%Y%m%d_%H%M%S")))
             .to_string_lossy()
@@ -423,12 +440,12 @@ pub async fn get_sql_server_version(conn: &DbConn) -> String {
         postgresql,mysql {
             diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>("version();"))
             .get_result::<String>(conn)
-            .unwrap_or_else(|_| "Unknown".to_string())
+            .unwrap_or_else(|_| "Unknown".to_owned())
         }
         sqlite {
             diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>("sqlite_version();"))
             .get_result::<String>(conn)
-            .unwrap_or_else(|_| "Unknown".to_string())
+            .unwrap_or_else(|_| "Unknown".to_owned())
         }
     }
 }
